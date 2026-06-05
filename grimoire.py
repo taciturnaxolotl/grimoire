@@ -171,7 +171,7 @@ def text_to_strokes(
                 # points for the device renderer, which collapses or drops
                 # 2-point strokes. Insert midpoints until every stroke has
                 # at least a few samples per segment.
-                dense = _densify(polyline, min_seg_len=120.0)
+                dense = _densify(polyline, min_seg_len=300.0)
                 points = []
                 for j, (gx, gy) in enumerate(dense):
                     sx = gx * scale

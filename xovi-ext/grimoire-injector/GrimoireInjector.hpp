@@ -50,7 +50,7 @@ private:
     std::atomic<bool> m_running{false};
     std::atomic<long long> m_lastLiftMs{0};
 
-    static constexpr int DEBOUNCE_MS = 4000;
+    static constexpr int DEBOUNCE_MS = 2500;
     static constexpr const char *IDLE_PATH = "/tmp/grimoire_idle";
 
     static void *debounceThreadFunc(void *arg);

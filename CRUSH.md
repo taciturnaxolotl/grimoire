@@ -97,8 +97,11 @@ Native C++ extension that runs inside xochitl's process via LD_PRELOAD.
 
 ### Build & deploy workflow
 
+The unified build script at `xovi-ext/build.sh` compiles **both** the
+extension `.so` and the `uinject` binary, then deploys both to the device.
+
 ```sh
-cd xovi-ext/grimoire-injector
+cd xovi-ext
 
 # First time: creates persistent Docker builder container
 # Subsequent runs: incremental rebuild (~30s vs ~2min full build)
@@ -110,9 +113,62 @@ ssh remarkable 'systemctl reset-failed xochitl && systemctl restart xochitl'
 
 The `build.sh` script:
 1. Creates/reuses a persistent `grimoire-builder` Docker container with the
-   `eeems/remarkable-toolchain:latest-rm2` image
-2. Runs `qmake6 && make` inside the container (incremental compilation)
-3. Copies the `.so` out and SCPs it to the device
+   `eeems/remarkable-toolchain:latest-rm2` image. Mounts the **whole**
+   `xovi-ext` tree at `/xovi-ext` (not just `grimoire-injector`) so any
+   sub-project can compile.
+2. Builds the extension: `qmake6 && make` inside the container
+   (incremental compilation).
+3. Builds `uinject`: `$CC -o uinject uinject.c -O2 $CFLAGS $LDFLAGS` after
+   sourcing the SDK environment-setup. **Must use `$CC` + `$CFLAGS`**, not a
+   bare `arm-remarkable-linux-gnueabi-gcc`, or the sysroot include paths
+   (stdio.h etc.) won't resolve.
+4. Copies both artifacts out and SCPs them to the device.
+
+**Deploy gotcha**: SCP to `/home/root/uinject` fails with "dest open ...
+Failure" if a uinject process is still running or the file is busy. Always
+`ssh remarkable 'killall uinject 2>/dev/null; rm -f /home/root/uinject'`
+before the SCP. The build script does this, but if deploying manually,
+remember the kill+rm dance.
+
+**The .so is loaded once at xochitl startup.** Updating it on disk requires
+restarting xochitl. The `uinject` binary, by contrast, is exec'd fresh each
+call, so a new uinject takes effect immediately — no restart needed.
+
+### xovi activation survives restart but not reboot
+
+The xovi tmpfs systemd drop-in (LD_PRELOAD injection) is lost on reboot.
+After a reboot, re-run `bash /home/root/xovi/start` (or triple-tap) to
+remount it. A plain `systemctl restart xochitl` preserves the tmpfs if it's
+already mounted.
+
+### uinject CLI
+
+```sh
+# Inject pen strokes (speed = ms delay between points, lower = faster)
+uinject --speed 3 strokes.json
+
+# Erase by retracing stroke paths with the eraser tool (6 offset passes)
+uinject --speed 2 --erase-strokes strokes.json
+
+# Erase a rectangular region (rm v6 coords)
+uinject --erase x,y,w,h
+```
+
+Key uinject learnings:
+- **Pen input arrives as mouse + touch events, NOT Qt tablet events.** The
+  reMarkable digitizer surfaces through `/dev/input/event1` as a Wacom
+  device. uinject writes raw evdev events there directly.
+- **Stroke injection is real-time replay** — uinject sleeps `--speed` ms
+  between every point, so a long reply with thousands of points takes many
+  seconds. Keep replies short and densify sparingly (see `_densify`
+  `min_seg_len=300`). Render is instant; the bottleneck is event replay.
+- **There is no erase primitive.** Erasing means retracing the ink path with
+  `BTN_TOOL_RUBBER`. The eraser tip is narrower than expected, so
+  `--erase-strokes` makes 6 offset passes (center + 4 cardinal ±10px + 1
+  diagonal) to fully cover stroke width.
+- **JSON parser must handle nested brackets.** The points array is
+  `[[x,y,...],[x,y,...]]`. A naive "stop at first `]`" only erases the first
+  point of each stroke. Track bracket depth.
 
 ### JSON stroke format (matches clipboard-injector)
 
@@ -130,12 +186,95 @@ The `build.sh` script:
 
 Generate with: `python grimoire.py --json output.json "text"`
 
-### Remaining xovi work
-- Fix vtable acquisition (hook QImage constructor like framebuffer-spy, or
-  find existing SceneLineItems in memory)
-- Find QQmlEngine to access Clipboard context property
-- Trigger paste programmatically after setting Clipboard.items
-- Alternative: direct scene graph manipulation (deeper RE needed)
+## Closed-loop daemon (`grimoire_loop.py`)
+
+The full pen-to-reply loop. Watches for pen idle, captures the screen,
+sends it to a vision model, and writes the reply back as ink.
+
+```sh
+python grimoire_loop.py [--model MODEL] [--once]
+```
+
+### Pipeline
+
+1. **Idle detection** (xovi extension, `PenIdleWatcher`): an event filter on
+   QGuiApplication watches mouse/touch press+release. A debounce thread
+   writes `/tmp/grimoire_idle` after the pen has been up for `DEBOUNCE_MS`
+   (currently 2500ms). The Python daemon polls that file over persistent SSH.
+2. **Capture**: trigger `/tmp/grimoire_screenshot`, the extension dumps the
+   framebuffer to `/tmp/grimoire_fb.raw`, pull it via SCP.
+3. **Crop**: drop top 80px (toolbar) and bottom 200px (swirl zone).
+4. **Blank check**: skip the API entirely if no real content (see grid
+   artifact note below).
+5. **Vision model**: send the full page image; the model does OCR +
+   relevance filtering + reply in one call. Returns `[NO_NEW_TEXT]` when
+   there's nothing new for it.
+6. **Position + inject**: find content bottom, render reply below it, SCP the
+   JSON, run uinject.
+
+### Persistent SSH
+
+`SSHSession` uses ControlMaster multiplexing (one connection, reused for all
+commands) to kill the ~1s handshake per call. Cleans up stale sockets on
+open and uses `ConnectTimeout=10` so it fails fast instead of hanging.
+
+### The reMarkable display grid artifact (IMPORTANT)
+
+The captured framebuffer contains a **uniform grid pattern**: isolated
+2px-tall rows every ~42px, each with **exactly 68 dark pixels**, pure black
+(value 0), spanning the entire screen height. This is a display/refresh
+artifact, NOT content. It is indistinguishable from ink by pixel value.
+
+To find real handwriting, filter it out by:
+- Counting dark pixels per row (`< 128` threshold).
+- Ignoring rows with **exactly 68** dark pixels (the grid signature).
+- Real text rows have variable counts (anything but 68) and form contiguous
+  clusters many rows tall; the grid is always isolated 2-row pairs.
+
+This filter is used both for the blank-page check and for finding the
+content bottom to position replies.
+
+### Vision model API
+
+Currently uses Charm's Hyper gateway:
+- Endpoint: `https://hyper.charmcli.dev/v1/chat/completions`
+- Auth: `HYPER_API_KEY` from `.env`
+- Model: `kimi-k2.6-vercel`
+- OpenAI-compatible format. **Roles must be `user`/`assistant`**, not
+  `model` (that's Gemini's format and Hyper rejects it with HTTP 400).
+- Images sent as `image_url` with `data:image/png;base64,...` URLs.
+
+Conversation history is kept as `(role, text)` tuples and replayed each
+turn for context. It resets on a real page change but NOT when our own
+injection changes the framebuffer hash (detected via `last_inject_y`).
+
+### Thinking indicator
+
+While capture + inference run, a background thread draws a small curly
+swirl in the bottom-left corner (rm coords ~x=-580, y=1750), then erases and
+redraws it in a loop (1s hold after draw, 3s pause after erase). On
+completion it does a final erase. The animation thread is stopped on every
+exit path (success, skip, blank, error) via an `Event`, and the main thread
+joins with a generous 15s timeout so the final erase finishes cleanly —
+**a short join timeout abandons the thread mid-erase and leaves ink behind.**
+
+## Hard-won iteration loop
+
+When working on grimoire, this is the tight loop that works:
+
+1. **Python changes** take effect on the next `grimoire_loop.py` run. No
+   deploy needed.
+2. **uinject changes**: `cd xovi-ext && bash build.sh` then the kill+rm+scp
+   dance. Effective immediately (exec'd per call).
+3. **Extension (.so) changes**: `bash build.sh`, then restart xochitl.
+   Slowest loop — avoid unless touching idle detection or framebuffer hooks.
+4. **Debugging the extension**: stderr is swallowed by xochitl. Write to a
+   file instead (`/tmp/grimoire_ext.log`) via a `grimoire_log()` helper.
+   Read it with `ssh remarkable 'cat /tmp/grimoire_ext.log'`.
+5. **Inspecting captures**: pull `/tmp/grimoire_fb.raw`, load as
+   `Image.frombytes("RGBA", (1404, 1872), raw)`, annotate with PIL, save a
+   PNG, and View it. This is how the grid artifact was found — always look
+   at the actual pixels before trusting a heuristic.
 
 ## Script usage (`grimoire.py`)
 
@@ -143,9 +282,14 @@ Generate with: `python grimoire.py --json output.json "text"`
 # File-based injection (creates new layer in .rm file)
 python grimoire.py input.rm output.rm "reply text"
 
-# JSON export for xovi injector
-python grimoire.py --json /tmp/grimoire_strokes.json "reply text"
+# JSON export for xovi injector (--y sets start Y in device coords)
+python grimoire.py --json /tmp/grimoire_strokes.json --y 400 "reply text"
 
 # Preview (renders SVG for visual tuning)
 python grimoire.py --preview "text"
 ```
+
+`grimoire.py` is also importable as a library:
+`text_to_strokes(text, x, y)` returns `si.Line` objects;
+`strokes_to_json(strokes, path)` writes the uinject JSON. The loop uses it
+this way for the thinking indicator instead of shelling out.

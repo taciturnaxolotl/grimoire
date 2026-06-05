@@ -18,6 +18,7 @@ import argparse
 import base64
 import hashlib
 import io
+import json
 import os
 import re
 import subprocess
@@ -30,6 +31,32 @@ import requests
 from dotenv import load_dotenv
 
 load_dotenv()
+
+
+# Only one uinject job may touch /dev/input/event1 at a time. Two
+# concurrent pen-event streams interleave into garbage strokes, so every
+# uinject invocation must hold this lock (see run_inject).
+import threading as _threading
+
+_inject_lock = _threading.Lock()
+_inject_verbose = False  # set from args.verbose in main()
+
+
+def run_inject(ssh, args, timeout):
+    """Run a uinject command, serialized against all other pen jobs.
+
+    `args` is the part after the binary, e.g. "--speed 2 --erase-strokes
+    /tmp/x.json". Blocks until any in-flight injection finishes so we
+    never drive the digitizer from two processes at once.
+    Passes -v to uinject when the daemon was started with -v/--verbose.
+    """
+    v_flag = " -v" if _inject_verbose else ""
+    with _inject_lock:
+        result = ssh.run(f"/home/root/uinject{v_flag} {args}", timeout=timeout)
+        if result.stderr:
+            for line in result.stderr.strip().split('\n'):
+                print(f"  {line}")
+        return result
 
 
 # ─── Persistent SSH session ────────────────────────────────────────
@@ -48,6 +75,17 @@ class SSHSession:
 
     def _open(self):
         """Establish master connection."""
+        # Clean up any stale socket from a previous run
+        if os.path.exists(self.socket):
+            subprocess.run(
+                ["ssh", "-o", f"ControlPath={self.socket}", "-O", "exit", self.host],
+                capture_output=True, timeout=5,
+            )
+            try:
+                os.unlink(self.socket)
+            except OSError:
+                pass
+
         cmd = [
             "ssh", "-fN",
             "-o", "ControlMaster=yes",
@@ -55,9 +93,10 @@ class SSHSession:
             "-o", "ControlPersist=600",
             "-o", "ServerAliveInterval=30",
             "-o", "ServerAliveCountMax=3",
+            "-o", "ConnectTimeout=10",
             self.host,
         ]
-        result = subprocess.run(cmd, capture_output=True, timeout=15)
+        result = subprocess.run(cmd, capture_output=True, timeout=20)
         if result.returncode != 0:
             raise RuntimeError(
                 f"SSH master failed: {result.stderr.decode().strip()}"
@@ -136,8 +175,8 @@ def capture_framebuffer(ssh):
     img = Image.frombytes("RGBA", (1404, 1872), raw)
     img_rgb = img.convert("RGB")
 
-    # Crop toolbar (top 80px)
-    img_rgb = img_rgb.crop((0, 80, img_rgb.width, img_rgb.height))
+    # Crop toolbar (top 80px) and swirl zone (bottom 200px)
+    img_rgb = img_rgb.crop((0, 80, img_rgb.width, img_rgb.height - 200))
     return img_rgb
 
 
@@ -171,61 +210,63 @@ def _image_to_base64(image):
     return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 
-def ask_gemini(image, conversation_history=None, model="gemini-2.5-flash-lite"):
-    """Send cropped handwriting image to Gemini, return response text.
+def ask_gemini(image, conversation_history=None, model="kimi-k2.6-vercel"):
+    """Send page image to Hyper API, return response text.
 
-    Combines OCR and LLM into a single API call — Gemini reads the
+    Combines OCR and LLM into a single API call — the model reads the
     handwriting directly from the image. Includes conversation history
     for context across multiple exchanges.
     """
-    api_key = os.environ.get("GEMINI_API_KEY")
+    api_key = os.environ.get("HYPER_API_KEY")
     if not api_key:
-        raise RuntimeError("GEMINI_API_KEY not set in .env")
+        raise RuntimeError("HYPER_API_KEY not set in .env")
 
     img_b64 = _image_to_base64(image)
 
-    # Build contents array with history + current turn
-    contents = []
+    # Build messages array with history + current turn
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+    ]
     if conversation_history:
         for role, text in conversation_history:
-            contents.append({
+            messages.append({
                 "role": role,
-                "parts": [{"text": text}],
+                "content": text,
             })
 
-    # Current turn: full page image
-    contents.append({
+    # Current turn: image + prompt
+    messages.append({
         "role": "user",
-        "parts": [
-            {"text": "Here is the current page:"},
+        "content": [
+            {"type": "text", "text": "Read this handwritten text and respond:"},
             {
-                "inline_data": {
-                    "mime_type": "image/png",
-                    "data": img_b64,
-                }
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:image/png;base64,{img_b64}",
+                },
             },
         ],
     })
 
     r = requests.post(
-        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
-        headers={"Content-Type": "application/json"},
-        params={"key": api_key},
+        "https://hyper.charmcli.dev/v1/chat/completions",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
         json={
-            "system_instruction": {
-                "parts": [{"text": SYSTEM_PROMPT}],
-            },
-            "contents": contents,
+            "model": model,
+            "messages": messages,
         },
         timeout=60,
     )
 
     if r.status_code != 200:
-        raise RuntimeError(f"Gemini API error {r.status_code}: {r.text[:200]}")
+        raise RuntimeError(f"Hyper API error {r.status_code}: {r.text[:200]}")
 
     data = r.json()
     try:
-        content = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        content = data["choices"][0]["message"]["content"].strip()
     except (KeyError, IndexError):
         content = "..."
 
@@ -264,8 +305,12 @@ def _strip_formatting(text):
 
 # ─── Render + Inject ──────────────────────────────────────────────
 
-def render_and_inject(ssh, text, reply_y=None):
-    """Render text as strokes and inject via uinject."""
+def render_and_inject(ssh, text, reply_y=None, speed_ms=3):
+    """Render text as strokes and inject via uinject.
+
+    reply_y: pixel Y coordinate to start rendering at (in device coords).
+    speed_ms: delay between points in milliseconds (lower = faster).
+    """
     json_path = "/tmp/grimoire_reply.json"
 
     cmd = [".venv/bin/python3", "grimoire.py", "--json", json_path]
@@ -282,7 +327,11 @@ def render_and_inject(ssh, text, reply_y=None):
     if r.returncode != 0:
         raise RuntimeError(f"SCP failed: {r.stderr.decode().strip()}")
 
-    result = ssh.run("/home/root/uinject /tmp/grimoire_strokes.json", timeout=60)
+    result = run_inject(
+        ssh,
+        f"--speed {speed_ms} /tmp/grimoire_strokes.json",
+        timeout=120,
+    )
     out = result.stdout.strip() if result.stdout else ""
     err = result.stderr.strip() if result.stderr else ""
     if result.returncode != 0:
@@ -292,6 +341,33 @@ def render_and_inject(ssh, text, reply_y=None):
 
 
 # ─── Idle watching ────────────────────────────────────────────────
+
+
+def stop_animation(anim_ssh, anim_stop, anim_thread):
+    """Halt the thinking animation and guarantee the swirl is erased.
+
+    Uses the animation thread's own SSH session (not the main one) so
+    the final erase doesn't contend with capture/SCP on a shared
+    ControlMaster socket.  The _inject_lock still serializes against
+    any in-flight pen job from the thread.
+    """
+    anim_stop.set()
+    print(f"  [anim] Waiting for thread to finish...")
+    anim_thread.join(timeout=20)
+    alive = anim_thread.is_alive()
+    print(f"  [anim] Thread {'still alive (timeout!)' if alive else 'exited'}")
+    try:
+        print(f"  [anim] Running final erase...")
+        result = run_inject(
+            anim_ssh,
+            "--speed 20 --erase-strokes /tmp/grimoire_thinking_live.json",
+            timeout=30,
+        )
+        print(f"  [anim] Final erase rc={result.returncode}")
+    except Exception as e:
+        print(f"  [anim] final erase failed: {e}")
+    finally:
+        anim_ssh.close()
 
 def watch_for_idle(ssh, last_hash):
     """Block until /tmp/grimoire_idle changes on device.
@@ -392,17 +468,26 @@ def _find_new_region(current_img, last_img, ignore_below_y=None):
 def main():
     parser = argparse.ArgumentParser(description="Grimoire continuous loop")
     parser.add_argument(
-        "--model", type=str, default="gemini-2.5-flash-lite",
-        help="Gemini model",
+        "--model", type=str, default="kimi-k2.6-vercel",
+        help="Hyper API model",
     )
     parser.add_argument(
         "--once", action="store_true",
         help="Run one cycle then exit (for testing)",
     )
+    parser.add_argument(
+        "-v", "--verbose", action="store_true",
+        help="Pass -v to uinject for progress logging",
+    )
     args = parser.parse_args()
+
+    global _inject_verbose
+    _inject_verbose = args.verbose
 
     print("=== Grimoire Loop ===")
     print(f"Model: {args.model}")
+    if _inject_verbose:
+        print("Verbose: uinject -v enabled")
     print("Waiting for pen idle signal...")
     print()
 
@@ -424,6 +509,87 @@ def main():
             t0 = time.time()
             print(f"[{_ts()}] Pen idle detected!")
 
+            # Animate thinking indicator: draw → erase → draw → erase → ...
+            # Runs in background while we do capture + API work
+            import threading
+
+            def _thinking_animation(ssh_session, stop_event):
+                """Draw and erase the thinking curl repeatedly."""
+                import math
+
+                def _make_thinking_json():
+                    """Generate swirl as strokes JSON."""
+                    # Swirl centered at y=1750
+                    swirl_pts = []
+                    for i in range(40):
+                        t = i / 39.0
+                        angle = t * math.pi * 3
+                        r = 15 + t * 25
+                        x = -580 + r * math.cos(angle)
+                        y = 1750 + r * math.sin(angle) * 0.6
+                        swirl_pts.append([x, y, 6, 11, 90, 170])
+                    swirl = {
+                        'points': swirl_pts,
+                        'rgba': 4278190080, 'color': 0,
+                        'bounds': [min(p[0] for p in swirl_pts), min(p[1] for p in swirl_pts),
+                                   max(p[0] for p in swirl_pts) - min(p[0] for p in swirl_pts),
+                                   max(p[1] for p in swirl_pts) - min(p[1] for p in swirl_pts)],
+                        'tool': 15, 'maskScale': 2.0, 'thickness': 2.0,
+                    }
+                    out_path = "/tmp/grimoire_thinking_live.json"
+                    with open(out_path, 'w') as f:
+                        json.dump([swirl], f)
+                    return out_path
+
+                drawing = False
+                device_json = "/tmp/grimoire_thinking_live.json"
+                thinking_json = _make_thinking_json()
+                ssh_session.scp_to(thinking_json, device_json)
+                print(f"  [anim] Animation thread started")
+
+                while not stop_event.is_set():
+                    try:
+                        action = "erase" if drawing else "draw"
+                        print(f"  [anim] Starting {action}...")
+                        if drawing:
+                            run_inject(
+                                ssh_session,
+                                f"--speed 20 --erase-strokes {device_json}",
+                                timeout=30,
+                            )
+                        else:
+                            run_inject(
+                                ssh_session,
+                                f"--speed 32 {device_json}",
+                                timeout=30,
+                            )
+                        print(f"  [anim] {action} done")
+                        drawing = not drawing
+                    except Exception as e:
+                        print(f"  [anim] ERROR: {e}")
+                    # 3s pause after erase; 1s hold after draw
+                    wait_time = 3.0 if drawing else 1.0
+                    print(f"  [anim] Waiting {wait_time}s...")
+                    if stop_event.wait(wait_time):
+                        print(f"  [anim] Stop signaled during wait, exiting loop")
+                        break
+                print(f"  [anim] Thread loop exited (drawing={drawing})")
+                # The caller performs the final, guaranteed erase in the
+                # main thread (see stop_animation) so it can't be cut short
+                # by a join timeout while a draw/erase is still in flight.
+
+            # The animation thread gets its own SSH connection so pen
+            # injection never shares a ControlMaster socket with the
+            # main thread's capture/SCP traffic.  Sharing caused the
+            # erase to get starved mid-stream when both threads hit the
+            # multiplexed socket at once.
+            anim_ssh = SSHSession("remarkable")
+            anim_stop = threading.Event()
+            anim_thread = threading.Thread(
+                target=_thinking_animation, args=(anim_ssh, anim_stop), daemon=True
+            )
+            anim_thread.start()
+
             try:
                 # Capture
                 print(f"  [{_ts()}] Capturing...")
@@ -433,6 +599,7 @@ def main():
                 # Quick hash check — skip if framebuffer unchanged
                 fb_hash = _framebuffer_hash(img)
                 if fb_hash == last_fb_hash:
+                    stop_animation(anim_ssh, anim_stop, anim_thread)
                     print(f"  [{_ts()}] Framebuffer unchanged, skipping.")
                     print()
                     continue
@@ -452,21 +619,33 @@ def main():
                         last_inject_y = None
                 last_page_hash = fb_hash
 
-                # Send full page to Gemini — it handles OCR + relevance filtering
-                print(f"  [{_ts()}] Asking Gemini ({len(conversation)} history turns)...")
+                # Quick content check — skip blank pages before hitting API
+                import numpy as np
+                gray = np.array(img.convert('L'))
+                dark_per_row = np.sum(gray < 128, axis=1)
+                non_grid_rows = np.where((dark_per_row > 5) & (dark_per_row != 68))[0]
+                if len(non_grid_rows) == 0:
+                    stop_animation(anim_ssh, anim_stop, anim_thread)
+                    print(f"  [{_ts()}] Blank page, skipping API call.")
+                    print()
+                    continue
+
+                # Send full page to model — it handles OCR + relevance filtering
+                print(f"  [{_ts()}] Asking {args.model} ({len(conversation)} history turns)...")
                 answer = ask_gemini(img, conversation, args.model)
                 print(f"  [{_ts()}] Reply ({_elapsed(t0)}): {answer[:80]}{'...' if len(answer) > 80 else ''}")
 
                 # Skip if Gemini says no new text
                 if "[NO_NEW_TEXT]" in answer:
+                    stop_animation(anim_ssh, anim_stop, anim_thread)
                     print(f"  [{_ts()}] No new text detected by Gemini, skipping.")
                     last_img = img
                     print()
                     continue
 
                 # Add to conversation history
-                conversation.append(("user", f"[handwritten question]"))
-                conversation.append(("model", answer))
+                conversation.append(("user", "[handwritten question]"))
+                conversation.append(("assistant", answer))
 
                 # Position reply below existing content.
                 # The reMarkable display has a uniform grid artifact:
@@ -509,6 +688,9 @@ def main():
 
                 # Render + Inject
                 print(f"  [{_ts()}] Rendering + injecting (reply_y={reply_y})...")
+                # Stop thinking animation and fully erase the swirl before
+                # we draw the reply, so the two never overlap on screen.
+                stop_animation(anim_ssh, anim_stop, anim_thread)
                 render_and_inject(ssh, answer, reply_y=reply_y)
                 last_inject_y = reply_y
                 print(f"  [{_ts()}] Injected ({_elapsed(t0)})")
@@ -517,6 +699,7 @@ def main():
                 print(f"  [{_ts()}] Done in {elapsed:.1f}s")
 
             except Exception as e:
+                stop_animation(anim_ssh, anim_stop, anim_thread)
                 print(f"  ERROR: {e}")
 
             print()
