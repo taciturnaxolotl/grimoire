@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
 """
-Grimoire — inject handwriting-style text as native ink into reMarkable .rm v6 pages.
+grimoire.py — Appends reply text as native ink to the user's handwriting.
 
-Reads an existing .rm v6 page, renders text using an SVG single-stroke font,
-and appends SceneLineItemBlocks into Layer 1. Original blocks are untouched.
+Reads the user's .rm page, appends a NEW LAYER (Layer 2) with reply strokes
+rendered with EMS Allure font.
 
 Usage:
-    python grimoire.py input.rm output.rm               # default text
-    python grimoire.py input.rm output.rm "hello"      # custom text
-    python grimoire.py --preview "Sample"               # SVG preview
+    python grimoire.py source.rm output.rm "reply text"
 """
 
 import argparse
@@ -23,30 +21,29 @@ from typing import Optional
 from rmscene import (
     CrdtId,
     CrdtSequenceItem,
+    LwwValue,
     read_blocks,
     write_blocks,
     scene_items as si,
 )
 from rmscene.scene_stream import (
     SceneLineItemBlock,
+    SceneTreeBlock,
+    TreeNodeBlock,
+    SceneGroupItemBlock,
 )
 
 
-# ───────────────────── Font loading ─────────────────────
-
 def parse_svg_font(path: str) -> tuple[dict, dict[str, float]]:
-    """Parse SVG single-stroke font. Returns (glyphs, advances)."""
     tree = ET.parse(path)
     root_e = tree.getroot()
     ns = {'svg': 'http://www.w3.org/2000/svg'}
     font_elem = root_e.find('.//svg:font', ns) or root_e.find('.//font')
     if font_elem is None:
-        raise ValueError(f"No <font> in {path}")
-
+        raise ValueError(f"Missing <font> in {path}")
     default_adv = float(font_elem.attrib.get('horiz-adv-x', 500))
     glyphs = {}
     advances = {' ': default_adv}
-
     for g in font_elem.findall('svg:glyph', ns) or font_elem.findall('glyph'):
         uni = g.attrib.get('unicode')
         if not uni:
@@ -61,7 +58,6 @@ def parse_svg_font(path: str) -> tuple[dict, dict[str, float]]:
 
 
 def _parse_d(d: str) -> list[list[tuple[float, float]]]:
-    """Parse M/L path into polylines. Bezier commands are skipped."""
     polylines = []
     current = []
     tokens = d.replace(',', ' ').split()
@@ -81,10 +77,10 @@ def _parse_d(d: str) -> list[list[tuple[float, float]]]:
             else:
                 current.append((x, y))
         elif cmd in ('C', 'Q'):
+            # skip bezier control points in batch
             i += 1
             while i < len(tokens) and tokens[i] not in ('M', 'L', 'C', 'Q', 'Z', 'z'):
                 i += 1
-        elif cmd in ('Z', 'z'):
             if current and len(current) >= 2:
                 current.append(current[0])
             i += 1
@@ -95,8 +91,12 @@ def _parse_d(d: str) -> list[list[tuple[float, float]]]:
     return polylines
 
 
-# ─── Global font cache
 _FONT_CACHE: Optional[tuple[dict, dict[str, float]]] = None
+DEFAULT_SCALE = 0.07
+DEFAULT_X = -550.0
+DEFAULT_Y = 850.0
+LINE_HEIGHT = 1.4
+MAX_LINE_WIDTH = 1100
 
 
 def load_font(name: str = "EMSAllure") -> tuple[dict, dict[str, float]]:
@@ -105,19 +105,8 @@ def load_font(name: str = "EMSAllure") -> tuple[dict, dict[str, float]]:
         return _FONT_CACHE
     font_dir = Path(__file__).parent / "fonts"
     svg_path = font_dir / f"{name}.svg"
-    if not svg_path.exists():
-        raise FileNotFoundError(f"Font not found: {svg_path}")
     _FONT_CACHE = parse_svg_font(str(svg_path))
     return _FONT_CACHE
-
-
-# ───────────────────── Text → strokes ─────────────────────
-
-DEFAULT_SCALE = 0.065
-DEFAULT_X = -550.0        # 80% of -702..701
-DEFAULT_Y = 750.0
-LINE_HEIGHT = 1.4         # multiplier on EM ascent (~800 units)
-MAX_LINE_WIDTH = 1100     # 80% of 1404 = ~1120
 
 
 def text_to_strokes(
@@ -128,20 +117,15 @@ def text_to_strokes(
     max_width: float = MAX_LINE_WIDTH,
     line_spacing: float = LINE_HEIGHT,
 ) -> list[si.Line]:
-    """Render text as reMarkable Line objects with word wrapping."""
     glyphs, advances = load_font()
     result = []
     cursor_x = origin_x
     cursor_y = origin_y
     rng = random.Random(text + str(origin_x))
-
     space_adv = advances.get(' ', 500) * scale
 
     for word in text.split():
-        # measure word width
         word_width = sum(advances.get(ch, 500) for ch in word) * scale
-
-        # wrap if needed
         if cursor_x + word_width > origin_x + max_width and cursor_x > origin_x:
             cursor_x = origin_x
             cursor_y += 800 * scale * line_spacing
@@ -163,7 +147,7 @@ def text_to_strokes(
                 points = []
                 for j, (gx, gy) in enumerate(polyline):
                     sx = gx * scale
-                    sy = -gy * scale  # SVG Y-up → rm Y-down
+                    sy = -gy * scale
                     sx += sy * slant
                     wobble = math.sin(cursor_x * 0.01 + j * 0.3) * 0.8
                     px = cursor_x + sx + x_jitter
@@ -184,41 +168,94 @@ def text_to_strokes(
                 ))
 
             cursor_x += adv + max(-2, x_jitter * 0.1) + abs(rng.uniform(-1, 1))
-
-        # space between words
         cursor_x += space_adv + rng.uniform(-2, 2)
 
     return result
 
 
-# ───────────────────── .rm injection ─────────────────────
+def _find_last_root_child(data: bytes) -> CrdtId:
+    """Find the last SceneGroupItemBlock value under root for left_id chaining."""
+    from io import BytesIO
+    ROOT = CrdtId(0, 1)
+    last_value = CrdtId(0, 0)
+    try:
+        with BytesIO(data) as f:
+            for block in read_blocks(f):
+                if isinstance(block, SceneGroupItemBlock) and block.parent_id == ROOT:
+                    last_value = block.item.value
+    except Exception:
+        pass
+    return last_value
 
-def splice_reply(
+
+def splice_reply_new_layer(
     input_path: str,
     output_path: str,
     reply_text: str,
 ) -> None:
-    """Read .rm v6 page, append reply strokes, write to output."""
-    LAYER_1 = CrdtId(0, 11)
+    """
+    Read .rm v6 page, APPEND a new layer with reply strokes.
+    Original blocks are untouched. Matches real xochitl layer structure.
+    """
     with open(input_path, "rb") as f:
         original_data = f.read()
 
+    # Build reply as strokes
     strokes = text_to_strokes(reply_text, DEFAULT_X, DEFAULT_Y)
-    blocks = []
+
+    # CRDT IDs — author 2 for programmatic content, starting at seq 500
+    # to avoid collision with existing data (real Layer 2 uses ~422-427)
+    LAYER_TREE = CrdtId(2, 500)   # tree_id for the new layer
+    ROOT = CrdtId(0, 1)
+
+    # Find the last group item under root to chain left_id correctly
+    last_root_child = _find_last_root_child(original_data)
+
+    # 1. Content tree root: SceneTree(tree_id=layer, node_id=(0,0), is_update=True)
+    content_tree = SceneTreeBlock(
+        tree_id=LAYER_TREE,
+        node_id=CrdtId(0, 0),
+        is_update=True,
+        parent_id=ROOT,
+    )
+
+    # 2. Layer metadata: TreeNodeBlock with label and visibility
+    label_block = TreeNodeBlock(si.Group(
+        node_id=LAYER_TREE,
+        label=LwwValue(CrdtId(2, 501), "grimoire"),
+        visible=LwwValue(CrdtId(2, 502), True),
+    ))
+
+    # 3. Add layer to root's children list (SceneGroupItemBlock)
+    group_item_block = SceneGroupItemBlock(
+        parent_id=ROOT,
+        item=CrdtSequenceItem(
+            item_id=CrdtId(2, 503),
+            left_id=last_root_child,
+            right_id=CrdtId(0, 0),
+            deleted_length=0,
+            value=LAYER_TREE,
+        ),
+    )
+
+    reply_blocks = [content_tree, label_block, group_item_block]
+
+    # 4. Line items parented to the layer tree_id
     for i, line in enumerate(strokes):
-        blocks.append(SceneLineItemBlock(
-            parent_id=LAYER_1,
+        reply_blocks.append(SceneLineItemBlock(
+            parent_id=LAYER_TREE,
             item=CrdtSequenceItem(
-                item_id=CrdtId(1, 200 + i),
-                left_id=CrdtId(0, 0),
+                item_id=CrdtId(2, 600 + i),
+                left_id=CrdtId(0, 0) if i == 0 else CrdtId(2, 600 + i - 1),
                 right_id=CrdtId(0, 0),
                 deleted_length=0,
                 value=line,
             ),
         ))
 
+    # Serialize reply blocks
     buf = BytesIO()
-    write_blocks(buf, blocks, options={"version": "3.4"})
+    write_blocks(buf, reply_blocks, options={"version": "3.4"})
     reply_bytes = buf.getvalue()
 
     HEADER_SIZE = 43
@@ -226,71 +263,20 @@ def splice_reply(
         reply_bytes = reply_bytes[HEADER_SIZE:]
 
     output_data = original_data + reply_bytes
+
     with open(output_path, "wb") as f:
         f.write(output_data)
 
-    print(f"Wrote {output_path} ({len(strokes)} strokes, "
+    print(f"Wrote {output_path} ({len(strokes)} reply strokes, "
           f"{len(original_data)}+{len(reply_bytes)}={len(output_data)} bytes)")
 
 
-# ───────────────────── SVG preview ─────────────────────
-
-def preview_svg(text: str, out_path: str = "preview.svg") -> None:
-    strokes = text_to_strokes(text, DEFAULT_X, DEFAULT_Y)
-    all_x = [p.x for line in strokes for p in line.points]
-    all_y = [p.y for line in strokes for p in line.points]
-    if not all_x:
-        return
-    min_x, max_x = min(all_x), max(all_x)
-    min_y, max_y = min(all_y), max(all_y)
-    pad = 20
-    w, h = max_x - min_x + 2*pad, max_y - min_y + 2*pad
-
-    svg = [
-        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="{min_x-pad} {min_y-pad} {w} {h}" width="{w*2}" height="{h*2}">',
-        '<rect width="100%" height="100%" fill="white"/>',
-        f'<line x1="{min_x}" y1="0" x2="{max_x}" y2="0" stroke="#eee" stroke-width="0.5" stroke-dasharray="4,4"/>',
-    ]
-    for line in strokes:
-        pts = line.points
-        d = f'M{pts[0].x:.1f},{pts[0].y:.1f}'
-        for p in pts[1:]:
-            d += f'L{p.x:.1f},{p.y:.1f}'
-        svg.append(
-            f'<path d="{d}" fill="none" stroke="black" '
-            f'stroke-width="{line.points[0].width*0.3:.1f}" '
-            f'stroke-linecap="round" stroke-linejoin="round"/>'
-        )
-    svg.append('</svg>')
-
-    with open(out_path, "w") as f:
-        f.write('\n'.join(svg))
-    print(f"Preview {out_path} {len(strokes)} strokes")
-
-
-# ───────────────────── CLI ─────────────────────
-
-def main():
-    parser = argparse.ArgumentParser(description="Grimoire — inject text as ink into .rm v6 pages")
-    parser.add_argument("input", nargs="?", help="Input .rm file")
-    parser.add_argument("output", nargs="?", help="Output .rm file (default: overwrite input)")
-    parser.add_argument("text", nargs="?", default="Grimoire says hello",
-                        help="Text to render")
-    parser.add_argument("--preview", nargs="?", const="preview.svg",
-                        help="Render SVG preview instead")
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("input")
+    parser.add_argument("output", nargs="?", default=None)
+    parser.add_argument("text", nargs="?", default="Grimoire says hello")
     args = parser.parse_args()
 
-    if args.preview:
-        out = args.preview if isinstance(args.preview, str) else "preview.svg"
-        preview_svg(args.text, out)
-        return
-
-    if not args.input:
-        parser.print_help()
-        return
-
-    splice_reply(args.input, args.output or args.input, args.text)
-
-
-if __name__ == "__main__":
-    main()
+    output = args.output or args.input
+    splice_reply_new_layer(args.input, output, args.text)
