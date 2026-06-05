@@ -16,7 +16,6 @@ public:
     Q_INVOKABLE bool setupVtable();
     Q_INVOKABLE int itemCount() const { return m_items.size(); }
     Q_INVOKABLE bool isReady() const { return m_vtableReady; }
-    Q_INVOKABLE bool injectToClipboard();
 
 public slots:
     void loadAndInject();

@@ -11,14 +11,31 @@
 #include <QQmlContext>
 #include <QQmlApplicationEngine>
 #include <QGuiApplication>
+#include <QQuickWindow>
+#include <QQmlEngine>
+#include <QGuiApplication>
+#include <QWindow>
+#include <QTabletEvent>
+#include <QPointingDevice>
+#include <QInputDevice>
+#include <QPointF>
 #include <cstdio>
 #include <cmath>
 #include <algorithm>
+#include <functional>
 #include <pthread.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 static GrimoireInjector *g_instance = nullptr;
+
+/* Provided by entry.c hooks */
+extern "C" {
+    void *grimoire_getQmlEngine(void);
+    void *grimoire_getSceneController(void);
+    int grimoire_checkReload(void);
+    void *grimoire_getFramebuffer(int *w, int *h, int *bpl, int *fmt);
+}
 
 static void *watchThreadFunc(void *) {
     fprintf(stderr, "[grimoire] Watch thread started\n");
@@ -28,6 +45,12 @@ static void *watchThreadFunc(void *) {
     long long lastMod = 0;
 
     while (true) {
+        /* Check for hot-reload signal */
+        if (grimoire_checkReload()) {
+            fprintf(stderr, "[grimoire] Hot-reload signal received! Re-scanning...\n");
+            lastMod = 0;  // Force re-read of stroke file
+        }
+
         struct stat st;
         if (stat(path, &st) == 0 && st.st_mtime != lastMod) {
             lastMod = st.st_mtime;
@@ -47,7 +70,6 @@ GrimoireInjector::GrimoireInjector(QObject *parent)
     : QObject(parent)
 {
     g_instance = this;
-    // Spawn a real pthread for file watching — no Qt event loop dependency
     pthread_t tid;
     pthread_create(&tid, nullptr, watchThreadFunc, nullptr);
     pthread_detach(tid);
@@ -55,96 +77,162 @@ GrimoireInjector::GrimoireInjector(QObject *parent)
 }
 
 void GrimoireInjector::loadAndInject() {
-    fprintf(stderr, "[grimoire] loadAndInject called on main thread\n");
+    QFileInfo fi(m_watchPath);
+    if (!fi.exists()) return;
+
+    qint64 modTime = fi.lastModified().toMSecsSinceEpoch();
+    if (modTime == m_lastModTime) return;
+
+    m_lastModTime = modTime;
+    fprintf(stderr, "[grimoire] File changed, injecting via synthetic tablet events...\n");
+
     int count = loadStrokes(m_watchPath);
-    if (count > 0) {
-        if (!m_vtableReady) setupVtable();
-        injectToClipboard();
-    }
-}
+    if (count == 0) return;
 
-bool GrimoireInjector::injectToClipboard() {
-    if (m_items.empty()) {
-        fprintf(stderr, "[grimoire] injectToClipboard: no items\n");
-        return false;
-    }
-
-    // Find the QQmlEngine via the application's root objects
-    QQmlEngine *engine = nullptr;
-    auto *app = qobject_cast<QGuiApplication*>(QCoreApplication::instance());
-    if (!app) {
-        fprintf(stderr, "[grimoire] No QGuiApplication\n");
-        return false;
-    }
-
-    // Try to find engine from top-level windows' QML engines
-    // The clipboard model is typically a context property on the root context
-    // We'll try to access it via the first available engine
-    QList<QQmlEngine*> engines;
-
-    // Walk through all QObjects to find QQmlEngine
-    // Simpler: use QQmlEngine::contextForObject on any known QML object
-    // For now, try to find it via the global app properties
-
-    // Alternative approach: directly manipulate the clipboard via
-    // xochitl's internal Clipboard model. The model is registered as
-    // a context property "Clipboard" in the root QML context.
-    // We need to find the engine first.
-
-    // Try iterating over top-level objects to find a QML-created object
-    for (QObject *obj : app->children()) {
-        QQmlContext *ctx = QQmlEngine::contextForObject(obj);
-        if (ctx) {
-            engine = ctx->engine();
-            break;
+    /* Find the focused window to post events to */
+    QWindow *targetWin = nullptr;
+    QObject *inputTarget = nullptr;
+    auto *guiApp = qobject_cast<QGuiApplication*>(QCoreApplication::instance());
+    if (guiApp) {
+        targetWin = guiApp->focusWindow();
+        inputTarget = guiApp->focusObject();
+        if (inputTarget) {
+            fprintf(stderr, "[grimoire] Focus object: %s @ %p\n",
+                    inputTarget->metaObject()->className(), (void*)inputTarget);
         }
-    }
-
-    if (!engine) {
-        // Fallback: try to get engine from any QQuickWindow
-        fprintf(stderr, "[grimoire] Could not find QQmlEngine from app children\n");
-        // Try another approach - enumerate all objects
-        for (QObject *obj : QObjectList()) {
-            QQmlContext *ctx = QQmlEngine::contextForObject(obj);
-            if (ctx) {
-                engine = ctx->engine();
-                break;
+        
+        if (!targetWin) {
+            for (QWindow *win : guiApp->topLevelWindows()) {
+                if (win->isVisible()) {
+                    targetWin = win;
+                    break;
+                }
+            }
+        }
+        
+        /* Check QQuickWindow properties for contentItem/activeFocusItem */
+        if (targetWin) {
+            const QMetaObject *mo = targetWin->metaObject();
+            for (int i = mo->propertyOffset(); i < mo->propertyCount(); i++) {
+                QMetaProperty prop = mo->property(i);
+                if (strcmp(prop.name(), "contentItem") == 0 || 
+                    strcmp(prop.name(), "activeFocusItem") == 0) {
+                    QVariant val = prop.read(targetWin);
+                    QObject *obj = val.value<QObject*>();
+                    if (obj) {
+                        fprintf(stderr, "[grimoire]   %s: %s @ %p\n",
+                                prop.name(), obj->metaObject()->className(), (void*)obj);
+                        if (!inputTarget) inputTarget = obj;
+                    }
+                }
             }
         }
     }
 
-    if (!engine) {
-        fprintf(stderr, "[grimoire] No QQmlEngine found, cannot inject\n");
-        return false;
+    if (!inputTarget && targetWin) {
+        inputTarget = targetWin;
+    }
+    
+    if (!inputTarget) {
+        fprintf(stderr, "[grimoire] No input target found\n");
+        return;
     }
 
-    fprintf(stderr, "[grimoire] Found QQmlEngine at %p\n", (void*)engine);
+    fprintf(stderr, "[grimoire] Posting %d strokes as tablet events to %s @ %p\n",
+            count, inputTarget->metaObject()->className(), (void*)inputTarget);
 
-    // Get root context and look for Clipboard
-    QQmlContext *rootCtx = engine->rootContext();
-    if (!rootCtx) {
-        fprintf(stderr, "[grimoire] No root context\n");
-        return false;
+    /* Find the pen/stylus pointing device */
+    const QPointingDevice *penDevice = nullptr;
+    QList<const QInputDevice*> allDevices = QInputDevice::devices();
+    for (const QInputDevice *dev : allDevices) {
+        const auto *pDev = dynamic_cast<const QPointingDevice*>(dev);
+        if (!pDev) continue;
+        fprintf(stderr, "[grimoire]   device: %s type=%d pointer=%d\n",
+                pDev->name().toUtf8().constData(),
+                (int)pDev->type(), (int)pDev->pointerType());
+        if (pDev->pointerType() == QPointingDevice::PointerType::Pen) {
+            penDevice = pDev;
+            break;
+        }
+    }
+    if (!penDevice) {
+        /* Fallback: use first pointing device */
+        for (const QInputDevice *dev : allDevices) {
+            const auto *pDev = dynamic_cast<const QPointingDevice*>(dev);
+            if (pDev) {
+                penDevice = pDev;
+                fprintf(stderr, "[grimoire] No pen device, using fallback: %s\n",
+                        pDev->name().toUtf8().constData());
+                break;
+            }
+        }
+    }
+    if (!penDevice) {
+        fprintf(stderr, "[grimoire] No pointing devices available\n");
+        return;
     }
 
-    QObject *clipboard = rootCtx->contextProperty("Clipboard").value<QObject*>();
-    if (!clipboard) {
-        fprintf(stderr, "[grimoire] No Clipboard context property found\n");
-        // List available context properties for debugging
-        fprintf(stderr, "[grimoire] Trying to find clipboard-like objects...\n");
-        return false;
+    /* Post each stroke as a sequence of tablet events: press → move... → release */
+    /* Transform from .rm v6 coords (origin top-center) to screen pixels (origin top-left) */
+    /* Screen: 1404x1872. RM v6: x[-702,701] y[0,1871] → screen x = rm_x + 702, y = rm_y */
+    const float xOff = 702.0f;
+    const float yOff = 0.0f;
+
+    for (int s = 0; s < m_items.size(); s++) {
+        auto *lineItem = reinterpret_cast<SceneLineItem*>(m_items[s].get());
+        const Line &line = lineItem->line;
+
+        if (line.points.isEmpty()) continue;
+
+        /* Tablet press at first point */
+        const auto &first = line.points.first();
+        QPointF pos(first.x + xOff, first.y + yOff);
+
+        QTabletEvent press(
+            QEvent::TabletPress, penDevice,
+            pos, pos,
+            first.pressure / 255.0,
+            0, 0, 0, 0, 0,
+            Qt::NoModifier,
+            Qt::LeftButton,
+            Qt::LeftButton
+        );
+        QCoreApplication::sendEvent(inputTarget, &press);
+
+        /* Tablet move for intermediate points */
+        for (int i = 1; i < line.points.size() - 1; i++) {
+            const auto &pt = line.points[i];
+            QPointF ppos(pt.x + xOff, pt.y + yOff);
+
+            QTabletEvent move(
+                QEvent::TabletMove, penDevice,
+                ppos, ppos,
+                pt.pressure / 255.0,
+                0, 0, 0, 0, 0,
+                Qt::NoModifier,
+                Qt::NoButton,
+                Qt::LeftButton
+            );
+            QCoreApplication::sendEvent(inputTarget, &move);
+        }
+
+        /* Tablet release at last point */
+        const auto &last = line.points.last();
+        QPointF lpos(last.x + xOff, last.y + yOff);
+
+        QTabletEvent release(
+            QEvent::TabletRelease, penDevice,
+            lpos, lpos,
+            last.pressure / 255.0,
+            0, 0, 0, 0, 0,
+            Qt::NoModifier,
+            Qt::LeftButton,
+            Qt::NoButton
+        );
+        QCoreApplication::sendEvent(inputTarget, &release);
     }
 
-    fprintf(stderr, "[grimoire] Found Clipboard object at %p\n", (void*)clipboard);
-
-    // Set items on the clipboard model
-    // The clipboard model has an 'items' property that accepts QList<shared_ptr<SceneItem>>
-    QVariant itemsVariant = QVariant::fromValue(m_items);
-    bool ok = clipboard->setProperty("items", itemsVariant);
-    fprintf(stderr, "[grimoire] Set Clipboard.items: %s (%d items)\n",
-            ok ? "ok" : "FAILED", m_items.size());
-
-    return ok;
+    fprintf(stderr, "[grimoire] Posted all tablet events\n");
 }
 
 int GrimoireInjector::loadStrokes(const QString& path) {

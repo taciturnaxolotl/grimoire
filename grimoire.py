@@ -94,7 +94,7 @@ def _parse_d(d: str) -> list[list[tuple[float, float]]]:
 _FONT_CACHE: Optional[tuple[dict, dict[str, float]]] = None
 DEFAULT_SCALE = 0.07
 DEFAULT_X = -550.0
-DEFAULT_Y = 850.0
+DEFAULT_Y = 200.0
 LINE_HEIGHT = 1.4
 MAX_LINE_WIDTH = 1100
 

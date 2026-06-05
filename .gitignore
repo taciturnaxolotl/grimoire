@@ -2,3 +2,28 @@
 pages/
 __pycache__/
 *.pyc
+
+# Build artifacts
+*.o
+*.so
+*.a
+build/
+Makefile
+.qmake.stash
+
+# Compiled binaries
+xovi-ext/uinject/uinject
+xovi-ext/grimoire-injector/uinject
+xovi-ext/grimoire-injector/grimoire-injector.so
+
+# Cloned repos (reference only)
+xovi-ext/xovi/
+xovi-ext/qmldiff/
+xovi-ext/clipboard-injector/
+
+# Analysis binaries
+analysis/xochitl
+analysis/hashtab
+
+# Frida scripts (temporary)
+frida-explore.js

@@ -1,0 +1,17 @@
+AFFECT /src/xofm/modules/library/ui/qml/EditDocument.qml
+    IMPORT dev.grimoire.injector 0.1
+
+    TRAVERSE ?#sceneController
+        LOCATE AFTER ALL
+        INSERT {
+            Timer {
+                id: grimoireTimer
+                interval: 500
+                repeat: false
+                onTriggered: {
+                    GrimoireInjector.loadAndInject()
+                }
+            }
+        }
+    END TRAVERSE
+END AFFECT
