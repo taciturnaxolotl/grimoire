@@ -271,12 +271,45 @@ def splice_reply_new_layer(
           f"{len(original_data)}+{len(reply_bytes)}={len(output_data)} bytes)")
 
 
+def strokes_to_json(strokes: list[si.Line], output_path: str) -> None:
+    """Export strokes as JSON for the xovi grimoire-injector extension."""
+    import json
+    items = []
+    for line in strokes:
+        points = []
+        for pt in line.points:
+            points.append([pt.x, pt.y, pt.speed, pt.width, pt.direction, pt.pressure])
+        xs = [p[0] for p in points]
+        ys = [p[1] for p in points]
+        bounds = [min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys)]
+        items.append({
+            "points": points,
+            "rgba": 4278190080,  # 0xFF000000
+            "color": line.color.value if hasattr(line.color, 'value') else 0,
+            "bounds": bounds,
+            "tool": line.tool.value if hasattr(line.tool, 'value') else 15,
+            "maskScale": line.thickness_scale,
+            "thickness": line.thickness_scale,
+        })
+    with open(output_path, "w") as f:
+        json.dump(items, f)
+    print(f"Wrote {output_path} ({len(items)} strokes)")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("input")
+    parser.add_argument("input", nargs="?", default=None)
     parser.add_argument("output", nargs="?", default=None)
     parser.add_argument("text", nargs="?", default="Grimoire says hello")
+    parser.add_argument("--json", dest="json_output", default=None,
+                        help="Export strokes as JSON for xovi injector")
     args = parser.parse_args()
 
-    output = args.output or args.input
-    splice_reply_new_layer(args.input, output, args.text)
+    if args.json_output:
+        strokes = text_to_strokes(args.text, DEFAULT_X, DEFAULT_Y)
+        strokes_to_json(strokes, args.json_output)
+    elif args.input:
+        output = args.output or args.input
+        splice_reply_new_layer(args.input, output, args.text)
+    else:
+        parser.error("Provide input.rm or --json output.json")
