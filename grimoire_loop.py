@@ -500,58 +500,144 @@ def render_and_inject(ssh, text, reply_y=None, speed_ms=3):
 
 
 def _scp_thinking_swirl(ssh):
-    """Generate the static thinking swirl JSON and copy it to the device.
+    """Parse border-top-right.svg into corner ornament strokes for the
+    thinking indicator. Falls back to a simple spiral if file is absent.
 
-    Done once at startup so the animation thread only needs to fire
-    draw/erase commands over the socket — no per-cycle file transfer.
+    Done once at startup — the animation thread just fires draw/erase
+    commands over the socket with no per-cycle file transfer.
     """
     import math
-    swirl_pts = []
-    for i in range(40):
-        t = i / 39.0
-        angle = t * math.pi * 3
-        r = 15 + t * 25
-        x = -580 + r * math.cos(angle)
-        y = 1750 + r * math.sin(angle) * 0.6
-        swirl_pts.append([x, y, 6, 11, 90, 170])
-    swirl = {
-        'points': swirl_pts,
-        'rgba': 4278190080, 'color': 0,
-        'bounds': [min(p[0] for p in swirl_pts), min(p[1] for p in swirl_pts),
-                   max(p[0] for p in swirl_pts) - min(p[0] for p in swirl_pts),
-                   max(p[1] for p in swirl_pts) - min(p[1] for p in swirl_pts)],
-        'tool': 15, 'maskScale': 2.0, 'thickness': 2.0,
-    }
+    import xml.etree.ElementTree as ET
+
+    def _cubicbez(p0, p1, p2, p3, n=4):
+        pts = []
+        for i in range(n + 1):
+            t = i / n
+            mt = 1 - t
+            pts.append((
+                mt**3*p0[0] + 3*mt**2*t*p1[0] + 3*mt*t**2*p2[0] + t**3*p3[0],
+                mt**3*p0[1] + 3*mt**2*t*p1[1] + 3*mt*t**2*p2[1] + t**3*p3[1],
+            ))
+        return pts
+
+    def _parse_d(d):
+        """SVG path d string → list of polylines (handles M L C Z)."""
+        tok = re.findall(
+            r'[MLCZz]|[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?', d
+        )
+        polylines, cur, cx, cy, cmd = [], [], 0.0, 0.0, None
+        i = 0
+        while i < len(tok):
+            if re.match(r'[MLCZz]', tok[i]):
+                cmd = tok[i]; i += 1; continue
+            if cmd == 'M' and i + 1 < len(tok):
+                if cur: polylines.append(cur)
+                cx, cy = float(tok[i]), float(tok[i+1])
+                cur = [(cx, cy)]; i += 2
+            elif cmd == 'L' and i + 1 < len(tok):
+                cx, cy = float(tok[i]), float(tok[i+1])
+                cur.append((cx, cy)); i += 2
+            elif cmd == 'C' and i + 5 < len(tok):
+                x1,y1 = float(tok[i]),float(tok[i+1])
+                x2,y2 = float(tok[i+2]),float(tok[i+3])
+                x,y   = float(tok[i+4]),float(tok[i+5])
+                for p in _cubicbez((cx,cy),(x1,y1),(x2,y2),(x,y))[1:]:
+                    cur.append(p)
+                cx, cy = x, y; i += 6
+            elif cmd in ('Z', 'z'):
+                if cur: polylines.append(cur)
+                cur = []
+            else:
+                i += 1
+        if cur:
+            polylines.append(cur)
+        return polylines
+
+    svg_file = Path(__file__).parent / "border-top-right.svg"
+    strokes = []
+
+    if svg_file.exists():
+        tree = ET.parse(str(svg_file))
+        root = tree.getroot()
+        ns = {'svg': 'http://www.w3.org/2000/svg'}
+        # Group transform in the SVG: matrix(1,0,0,1,-215.007869,-426.567829)
+        tx, ty = -215.007869, -426.567829
+
+        all_polys = []
+        for el in (root.findall('.//svg:path', ns) or root.findall('.//path')):
+            for poly in _parse_d(el.attrib.get('d', '')):
+                all_polys.append([(x + tx, y + ty) for x, y in poly])
+
+        if all_polys:
+            # After the group translate the SVG occupies ~[0,173]×[0,155].
+            # The design is a top-right corner: spirals at (173,0), horizontal
+            # bar extending left, vertical bar extending down.
+            # Map it to all four corners of the reMarkable page, then interleave
+            # strokes from each corner in round-robin so they appear to grow
+            # simultaneously.
+            # rm coords: x ∈ [-702, 702], y ∈ [0, 1872] top-to-bottom.
+            svg_w, svg_h = 173.0, 155.0
+
+            # (flip_x, flip_y, rm_x_min, rm_x_max, rm_y_min, rm_y_max)
+            # Outer edge 30 units from each page edge; boxes are 400×380 so
+            # the ornaments read clearly and fill their corners with presence.
+            corners = [
+                (False, False,  182,  682,   20,  400),  # top-right
+                (True,  False, -682, -182,   20,  400),  # top-left
+                (False, True,   182,  682, 1472, 1852),  # bottom-right
+                (True,  True,  -682, -182, 1472, 1852),  # bottom-left
+            ]
+
+            def make_strokes(polys, flip_x, flip_y, rx0, rx1, ry0, ry1):
+                def to_rm(sx, sy):
+                    fx = ((svg_w - sx) if flip_x else sx) / svg_w
+                    fy = ((svg_h - sy) if flip_y else sy) / svg_h
+                    return rx0 + fx * (rx1 - rx0), ry0 + fy * (ry1 - ry0)
+                result = []
+                for poly in polys:
+                    if len(poly) < 2:
+                        continue
+                    pts = [[*to_rm(x, y), 6, 11, 90, 170] for x, y in poly]
+                    xs = [p[0] for p in pts]; ys = [p[1] for p in pts]
+                    result.append({
+                        'points': pts,
+                        'rgba': 4278190080, 'color': 0,
+                        'bounds': [min(xs), min(ys), max(xs)-min(xs), max(ys)-min(ys)],
+                        'tool': 15, 'maskScale': 2.0, 'thickness': 2.0,
+                    })
+                return result
+
+            per_corner = [make_strokes(all_polys, *c) for c in corners]
+
+            # Interleave: tl[0], tr[0], br[0], bl[0], tl[1], tr[1], ...
+            max_len = max(len(c) for c in per_corner)
+            for i in range(max_len):
+                for corner_strokes in per_corner:
+                    if i < len(corner_strokes):
+                        strokes.append(corner_strokes[i])
+
+    if not strokes:
+        # Fallback: simple spiral
+        swirl_pts = []
+        for i in range(40):
+            t = i / 39.0
+            angle = t * math.pi * 3
+            r = 15 + t * 25
+            swirl_pts.append([-580 + r * math.cos(angle),
+                               1750 + r * math.sin(angle) * 0.6,
+                               6, 11, 90, 170])
+        xs = [p[0] for p in swirl_pts]; ys = [p[1] for p in swirl_pts]
+        strokes = [{'points': swirl_pts, 'rgba': 4278190080, 'color': 0,
+                    'bounds': [min(xs), min(ys), max(xs)-min(xs), max(ys)-min(ys)],
+                    'tool': 15, 'maskScale': 2.0, 'thickness': 2.0}]
+
     local = "/tmp/grimoire_thinking_live.json"
     with open(local, 'w') as f:
-        json.dump([swirl], f)
+        json.dump(strokes, f)
     ssh.scp_to(local, "/tmp/grimoire_thinking_live.json")
+    print(f"[swirl] {len(strokes)} ornament strokes "
+          f"({'SVG' if svg_file.exists() else 'fallback spiral'})")
 
-
-def stop_animation(anim_stop, anim_thread):
-    """Halt the thinking animation and guarantee the swirl is erased.
-
-    Injection goes over the persistent socket now (serialized inside the
-    daemon), so there's no SSH contention to worry about. We still set
-    the stop flag, join the thread, then run one final guaranteed erase.
-    """
-    anim_stop.set()
-    _vprint(f"  [anim] Waiting for thread to finish...")
-    # Join without a short timeout: the thread finishes its in-flight
-    # command (draw or erase) and exits. Returning early here while a
-    # draw is still running would let the final erase race ahead of it,
-    # leaving the swirl on screen — exactly the "kept animating" bug.
-    anim_thread.join()
-    _vprint(f"  [anim] Thread exited")
-    try:
-        _vprint(f"  [anim] Running final erase...")
-        result = run_inject(
-            None, "erase", "/tmp/grimoire_thinking_live.json",
-            speed_ms=20, timeout=30,
-        )
-        _vprint(f"  [anim] Final erase ok={result.get('ok')} points={result.get('points', '?')}")
-    except Exception as e:
-        print(f"  [anim] final erase failed: {e}")
 
 
 def watch_for_idle(device, last_ts):
@@ -626,6 +712,18 @@ def _find_new_region(current_img, last_img, ignore_below_y=None):
         cutoff = ignore_below_y - 80
         if 0 < cutoff < curr.shape[0]:
             mask[cutoff:, :] = False
+
+    # Exclude the four corner ornament zones from diff detection.
+    # Ornament boxes (rm coords): x ±[182,682], y top [20,400], bottom [1472,1852]
+    # Converted to image pixels (rm_x+702, rm_y-80); image is 1404×1592.
+    cx = 500   # ornament horizontal extent from each edge (img px)
+    cy_top = 330   # ornament vertical extent from top
+    cy_bot = 210   # ornament vertical extent from bottom
+    h, w = curr.shape
+    mask[:cy_top, :cx] = False            # top-left corner
+    mask[:cy_top, w - cx:] = False        # top-right corner
+    mask[h - cy_bot:, :cx] = False        # bottom-left corner
+    mask[h - cy_bot:, w - cx:] = False    # bottom-right corner
 
     # Threshold of 30 (was 50) catches lighter handwriting strokes without
     # being so sensitive that e-ink refresh noise triggers false positives.
@@ -709,10 +807,11 @@ def main():
     print("Waiting for pen idle signal...")
     print()
 
-    last_fb_hash = None   # quick hash to skip unchanged frames
-    last_inject_y = None  # device Y where we last injected
-    last_img = None       # previous frame for pixel-diff new-region detection
-    conversation = []     # text history: list of {"role":..., "content":...}
+    last_fb_hash = None      # quick hash to skip unchanged frames
+    last_inject_y = None     # device Y where we last injected
+    last_img = None          # previous frame for pixel-diff detection
+    conversation = []        # text history: list of {"role":..., "content":...}
+    ornaments_drawn = False  # corner ornaments are permanent; only draw once
 
     try:
         while True:
@@ -723,76 +822,44 @@ def main():
             t0 = time.time()
             print(f"[{_ts()}] Pen idle detected!")
 
-            # Animate thinking indicator: draw → erase → draw → erase → ...
-            # Runs in background while we do capture + API work
-            import threading
-
-            def _thinking_animation(stop_event):
-                """Draw and erase the thinking curl repeatedly.
-
-                The swirl JSON is already on the device (SCP'd once at
-                startup). All injection goes over the persistent socket.
-                """
-                import math
-
-                drawing = False
-                device_json = "/tmp/grimoire_thinking_live.json"
-                _vprint(f"  [anim] Animation thread started")
-
-                while not stop_event.is_set():
-                    try:
-                        action = "erase" if drawing else "draw"
-                        _vprint(f"  [anim] Starting {action}...")
-                        # Re-check stop right before injecting so we never
-                        # start a fresh draw the caller will have to erase.
-                        if stop_event.is_set():
-                            break
-                        if drawing:
-                            run_inject(
-                                None, "erase", device_json,
-                                speed_ms=20, timeout=30,
-                            )
-                        else:
-                            run_inject(
-                                None, "draw", device_json,
-                                speed_ms=32, timeout=30,
-                            )
-                        _vprint(f"  [anim] {action} done")
-                        drawing = not drawing
-                    except Exception as e:
-                        _vprint(f"  [anim] ERROR: {e}")
-                    # 3s pause after erase; 1s hold after draw
-                    wait_time = 3.0 if drawing else 1.0
-                    _vprint(f"  [anim] Waiting {wait_time}s...")
-                    if stop_event.wait(wait_time):
-                        _vprint(f"  [anim] Stop signaled during wait, exiting loop")
-                        break
-                _vprint(f"  [anim] Thread loop exited (drawing={drawing})")
-                # The caller performs the final, guaranteed erase in the
-                # main thread (see stop_animation) so it can't be cut short
-                # by a join timeout while a draw/erase is still in flight.
-
-            anim_stop = threading.Event()
-            anim_thread = threading.Thread(
-                target=_thinking_animation, args=(anim_stop,), daemon=True
-            )
-            anim_thread.start()
-
             try:
                 # Capture
                 print(f"  [{_ts()}] Capturing...")
                 img = capture_framebuffer(ssh)
                 print(f"  [{_ts()}] Captured ({_elapsed(t0)})")
 
+                # Check if the page is blank (only grid dots, no real ink).
+                # Reuse the first-frame content-detection path: if it finds
+                # nothing, the page is empty — treat as a new page and reset.
+                page_crop, _ = _find_new_region(img, None)
+                if page_crop is None:
+                    print(f"  [{_ts()}] Empty page — resetting state.")
+                    last_img = None
+                    last_inject_y = None
+                    ornaments_drawn = False
+                    conversation.clear()
+                    print()
+                    continue
+
                 # Detect new content via pixel diff against last frame.
                 # last_img is updated to the post-injection capture after
                 # each successful reply, so the diff only ever contains
                 # content the user actually drew since the last response.
-                new_crop, _ = _find_new_region(img, last_img)
+                new_crop, content_y2 = _find_new_region(img, last_img)
                 last_img = img
 
+                # Fire-and-forget: draw corner ornaments once on the first
+                # idle that finds real content on the page.
+                if not ornaments_drawn:
+                    ornaments_drawn = True
+                    _threading.Thread(
+                        target=lambda: run_inject(None, "draw",
+                                                 "/tmp/grimoire_thinking_live.json",
+                                                 speed_ms=4, timeout=120),
+                        daemon=True,
+                    ).start()
+
                 if new_crop is None:
-                    stop_animation(anim_stop, anim_thread)
                     last_fb_hash = _framebuffer_hash(img)
                     print(f"  [{_ts()}] No new content, skipping.")
                     print()
@@ -809,9 +876,6 @@ def main():
                 print(f"  [{_ts()}] Model: Q={str(question)[:80]!r}  A={str(answer)[:80]!r}")
 
                 if not answer or answer == "null":
-                    stop_animation(anim_stop, anim_thread)
-                    # Update last_img so we don't keep re-diffing the same
-                    # e-ink refresh artifacts on subsequent idle triggers.
                     last_img = img
                     print(f"  [{_ts()}] No actionable content, skipping.")
                     print()
@@ -824,50 +888,14 @@ def main():
                 conversation.append({"role": "user", "content": str(question)})
                 conversation.append({"role": "assistant", "content": answer})
 
-                # Position reply below existing content.
-                # The reMarkable display has a uniform grid artifact:
-                # isolated 2-row pairs with exactly 68 dark pixels each.
-                # Real handwriting has variable pixel counts across many
-                # consecutive rows. Filter by requiring non-68 counts or
-                # clusters taller than 4 rows.
-                import numpy as np
-                gray = np.array(img.convert('L'))
-                dark_per_row = np.sum(gray < 128, axis=1)
-
-                # Mark rows as "real content" if they have dark pixels
-                # AND the count isn't exactly 68 (grid artifact), OR
-                # they're part of a cluster > 4 rows tall.
-                has_dark = dark_per_row > 5
-                not_grid = dark_per_row != 68
-                candidate_rows = np.where(has_dark & not_grid)[0]
-
-                content_bottom = None
-                if len(candidate_rows) > 0:
-                    # Group into contiguous clusters
-                    gaps = np.diff(candidate_rows)
-                    clusters = []
-                    start = candidate_rows[0]
-                    for i, g in enumerate(gaps):
-                        if g > 10:
-                            clusters.append((start, candidate_rows[i]))
-                            start = candidate_rows[i + 1]
-                    clusters.append((start, candidate_rows[-1]))
-
-                    # Use bottom of last real cluster
-                    if clusters:
-                        content_bottom = clusters[-1][1]
-
-                if content_bottom is not None:
-                    reply_y = min(content_bottom + 80 + 150, 1750)
-                else:
-                    reply_y = 300
-                print(f"  [{_ts()}] Content bottom: {content_bottom}, reply_y={reply_y}")
+                # Place reply just below the bottom of the changed region.
+                # content_y2 is in cropped-image coordinates; add 80 for the
+                # stripped toolbar to get device Y, then 150px gap.
+                reply_y = min(content_y2 + 80 + 150, 1750)
+                print(f"  [{_ts()}] Content bottom: {content_y2}, reply_y={reply_y}")
 
                 # Render + Inject
                 print(f"  [{_ts()}] Rendering + injecting (reply_y={reply_y})...")
-                # Stop thinking animation and fully erase the swirl before
-                # we draw the reply, so the two never overlap on screen.
-                stop_animation(anim_stop, anim_thread)
                 render_and_inject(ssh, answer, reply_y=reply_y)
                 last_inject_y = reply_y
                 print(f"  [{_ts()}] Injected ({_elapsed(t0)})")
@@ -890,7 +918,6 @@ def main():
                 print(f"  [{_ts()}] Done in {elapsed:.1f}s")
 
             except Exception as e:
-                stop_animation(anim_stop, anim_thread)
                 print(f"  ERROR: {e}")
 
             print()
