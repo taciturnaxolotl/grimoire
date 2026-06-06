@@ -9,6 +9,7 @@
 #include <QMetaObject>
 #include <QQmlEngine>
 #include <QQmlContext>
+#include <QQmlComponent>
 #include <QQmlApplicationEngine>
 #include <QGuiApplication>
 #include <QQuickWindow>
@@ -78,8 +79,10 @@ static void *watchThreadFunc(void *) {
 
     const char *path = "/tmp/grimoire_strokes.json";
     const char *armedPath = "/tmp/grimoire_armed";
+    const char *thinkingPath = "/tmp/grimoire_thinking";
     long long lastMod = 0;
     int lastArmed = -1;
+    int lastThinking = -1;
 
     while (true) {
         /* Check armed state file */
@@ -100,6 +103,42 @@ static void *watchThreadFunc(void *) {
                 }
             }
             fclose(afp);
+        }
+
+        /* Check thinking state file */
+        {
+            int tval = 0;
+            FILE *tfp = fopen(thinkingPath, "r");
+            if (tfp) {
+                char tbuf[16] = {0};
+                if (fgets(tbuf, sizeof(tbuf), tfp)) {
+                    char *tp = tbuf;
+                    while (*tp == '"' || *tp == ' ' || *tp == '\t') tp++;
+                    tval = atoi(tp);
+                }
+                fclose(tfp);
+            }
+            /* File missing or contains 0 → not thinking */
+            if (tval != lastThinking && g_instance) {
+                lastThinking = tval;
+                int capturedTval = tval;
+                QMetaObject::invokeMethod(g_instance, [capturedTval]() {
+                    g_instance->setThinking(capturedTval != 0);
+                }, Qt::QueuedConnection);
+            }
+        }
+
+        /* Check safezone state file */
+        {
+            int szval = (access("/tmp/grimoire_safezone", F_OK) == 0) ? 1 : 0;
+            static int lastSafezone = -1;
+            if (szval != lastSafezone && g_instance) {
+                lastSafezone = szval;
+                int capturedSz = szval;
+                QMetaObject::invokeMethod(g_instance, [capturedSz]() {
+                    g_instance->setSafezone(capturedSz != 0);
+                }, Qt::QueuedConnection);
+            }
         }
 
         /* Check for hot-reload signal */
@@ -172,6 +211,150 @@ void GrimoireInjector::setArmed(bool armed) {
     }
     grimoire_log("setArmed(%d)", armed);
     emit armedChanged(armed);
+}
+
+void GrimoireInjector::setThinking(bool thinking) {
+    if (m_thinking == thinking) return;
+    m_thinking = thinking;
+    grimoire_log("setThinking(%d)", thinking);
+
+    /* Show/hide a simple pulsing dot overlay on the focused window */
+    QQuickWindow *win = qobject_cast<QQuickWindow*>(QGuiApplication::focusWindow());
+    if (!win) {
+        grimoire_log("setThinking: no focus window");
+        emit thinkingChanged(thinking);
+        return;
+    }
+
+    if (thinking) {
+        /* Create a small pulsing circle via QML string evaluation */
+        QQmlEngine *engine = qmlEngine(win->contentItem());
+        if (!engine) {
+            /* Try to get engine from the window's QML context */
+            QQmlContext *ctx = QQmlEngine::contextForObject(win->contentItem());
+            if (ctx) engine = ctx->engine();
+        }
+        if (engine) {
+            const char *qml = R"(
+                import QtQuick 2.15
+                Row {
+                    spacing: 8
+                    anchors.horizontalCenter: parent.horizontalCenter
+                    anchors.bottom: parent.bottom
+                    anchors.bottomMargin: 30
+                    property int step: 0
+                    Rectangle { id: d0; width: 10; height: 10; radius: 5; color: "#000000"; visible: false }
+                    Rectangle { id: d1; width: 10; height: 10; radius: 5; color: "#000000"; visible: false }
+                    Rectangle { id: d2; width: 10; height: 10; radius: 5; color: "#000000"; visible: false }
+                    Timer {
+                        interval: 800
+                        repeat: true
+                        running: true
+                        onTriggered: {
+                            parent.step = (parent.step + 1) % 7
+                            var s = parent.step
+                            d0.visible = (s === 0 || s === 1 || s === 2 || s === 3)
+                            d1.visible = (s === 1 || s === 2 || s === 3 || s === 4)
+                            d2.visible = (s === 2 || s === 3 || s === 4 || s === 5)
+                        }
+                    }
+                }
+            )";
+            QQmlComponent comp(engine);
+            comp.setData(qml, QUrl());
+            if (comp.isReady()) {
+                QObject *obj = comp.create();
+                if (obj) {
+                    obj->setParent(win->contentItem());
+                    QQuickItem *item = qobject_cast<QQuickItem*>(obj);
+                    if (item) {
+                        item->setParentItem(win->contentItem());
+                        m_thinkingOverlay = item;
+                        grimoire_log("Thinking overlay created");
+                    }
+                }
+            } else {
+                grimoire_log("Thinking overlay QML error: %s",
+                             comp.errorString().toUtf8().constData());
+            }
+        } else {
+            grimoire_log("setThinking: no QQmlEngine available");
+        }
+    } else {
+        /* Remove overlay */
+        if (m_thinkingOverlay) {
+            m_thinkingOverlay->deleteLater();
+            m_thinkingOverlay = nullptr;
+            grimoire_log("Thinking overlay removed");
+        }
+    }
+
+    emit thinkingChanged(thinking);
+}
+
+void GrimoireInjector::setSafezone(bool safezone) {
+    if (m_safezone == safezone) return;
+    m_safezone = safezone;
+    grimoire_log("setSafezone(%d)", safezone);
+
+    QQuickWindow *win = qobject_cast<QQuickWindow*>(QGuiApplication::focusWindow());
+    if (!win) { emit thinkingChanged(m_thinking); return; }
+
+    if (safezone) {
+        QQmlEngine *engine = qmlEngine(win->contentItem());
+        if (!engine) {
+            QQmlContext *ctx = QQmlEngine::contextForObject(win->contentItem());
+            if (ctx) engine = ctx->engine();
+        }
+        if (engine) {
+            const char *qml = R"(
+                import QtQuick 2.15
+                Canvas {
+                    width: 40; height: 36
+                    anchors.horizontalCenter: parent.horizontalCenter
+                    anchors.bottom: parent.bottom
+                    anchors.bottomMargin: 30
+                    opacity: 1.0
+                    onPaint: {
+                        var ctx = getContext("2d");
+                        ctx.fillStyle = "#555555";
+                        ctx.beginPath();
+                        ctx.moveTo(20, 0);
+                        ctx.lineTo(40, 36);
+                        ctx.lineTo(0, 36);
+                        ctx.closePath();
+                        ctx.fill();
+                    }
+                    Timer {
+                        interval: 1000
+                        repeat: true
+                        running: true
+                        onTriggered: parent.visible = !parent.visible
+                    }
+                }
+            )";
+            QQmlComponent comp(engine);
+            comp.setData(qml, QUrl());
+            if (comp.isReady()) {
+                QObject *obj = comp.create();
+                if (obj) {
+                    obj->setParent(win->contentItem());
+                    QQuickItem *item = qobject_cast<QQuickItem*>(obj);
+                    if (item) {
+                        item->setParentItem(win->contentItem());
+                        m_safezoneOverlay = item;
+                        grimoire_log("Safezone overlay created");
+                    }
+                }
+            }
+        }
+    } else {
+        if (m_safezoneOverlay) {
+            m_safezoneOverlay->deleteLater();
+            m_safezoneOverlay = nullptr;
+            grimoire_log("Safezone overlay removed");
+        }
+    }
 }
 
 void GrimoireInjector::loadAndInject() {

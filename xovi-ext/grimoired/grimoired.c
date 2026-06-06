@@ -53,6 +53,9 @@
 #define API_MODEL      "gpt-4.1-nano"
 #define FONT_PATH      "/home/root/EMSAllure.svg"
 #define RENDER_OUT_PATH "/tmp/grimoire_render.json"
+#define THINKING_PATH   "/tmp/grimoire_thinking"
+#define ORNAMENTS_PATH  "/home/root/ornaments.json"
+#define SAFEZONE_PATH   "/tmp/grimoire_safezone"
 #define MAX_CMD      8192
 
 /* Framebuffer dimensions */
@@ -82,6 +85,7 @@ static int g_verbose = 0;
 static int g_dev_fd = -1;
 static volatile sig_atomic_t g_running = 1;
 static pthread_mutex_t g_inject_lock = PTHREAD_MUTEX_INITIALIZER;
+static time_t g_safezone_until = 0;
 
 /* ─── logging ────────────────────────────────────────────────────── */
 
@@ -1124,6 +1128,117 @@ static int read_armed_state(void) {
     return atoi(p) != 0;
 }
 
+/* ─── idle-state reader ──────────────────────────────────────────── */
+
+static long long read_idle_ts(void) {
+    FILE *fp = fopen(IDLE_PATH, "r");
+    if (!fp) return -1;
+    long long ts = -1;
+    fscanf(fp, "%lld", &ts);
+    fclose(fp);
+    return ts;
+}
+
+/* ─── full pipeline ──────────────────────────────────────────────── */
+
+static void run_pipeline(void) {
+    static int ornaments_drawn = 0;
+    log_msg("Pipeline: starting\n");
+
+    /* 1. Capture framebuffer */
+    unsigned char *fb = trigger_and_read_fb();
+    if (!fb) {
+        log_msg("Pipeline: capture timeout\n");
+        return;
+    }
+
+    /* 2. Blank check */
+    if (page_is_empty(fb)) {
+        log_msg("Pipeline: page empty, skipping\n");
+        free(fb);
+        return;
+    }
+
+    /* 3. Find content bottom */
+    int content_bottom = find_content_bottom(fb);
+    log_msg("Pipeline: content_bottom=%d\n", content_bottom);
+
+    /* 4. Save cropped PNG for API */
+    if (save_cropped_png(fb, CAPTURE_OUT_PATH) != 0) {
+        log_msg("Pipeline: PNG save failed\n");
+        free(fb);
+        return;
+    }
+    free(fb);
+
+    /* 5. Draw ornaments once (first reply only), then show thinking dots */
+    if (!ornaments_drawn) {
+        ornaments_drawn = 1;
+        char *orn_json = NULL;
+        long orn_size = 0;
+        if (load_file(ORNAMENTS_PATH, &orn_json, &orn_size) == 0 && orn_size > 0) {
+            log_msg("Pipeline: drawing ornaments (%ld bytes)\n", orn_size);
+            pthread_mutex_lock(&g_inject_lock);
+            do_draw(g_dev_fd, orn_json, 3000);
+            pthread_mutex_unlock(&g_inject_lock);
+            free(orn_json);
+        } else {
+            log_msg("Pipeline: no ornaments file at %s\n", ORNAMENTS_PATH);
+        }
+    }
+
+    /* Signal thinking indicator ON (dots during API call) */
+    {
+        FILE *tf = fopen(THINKING_PATH, "w");
+        if (tf) { fputs("1\n", tf); fclose(tf); }
+    }
+
+    /* 6. Call vision API */
+    char *answer = call_vision_api(CAPTURE_OUT_PATH);
+
+    if (!answer) {
+        log_msg("Pipeline: no answer from API\n");
+        unlink(THINKING_PATH);
+        return;
+    }
+
+    log_msg("Pipeline: answer=\"%s\"\n", answer);
+
+    /* 6. Calculate reply Y position */
+    int reply_y = content_bottom + 80 + 60;
+    if (reply_y > 1750) reply_y = 1750;
+    log_msg("Pipeline: reply_y=%d\n", reply_y);
+
+    /* 7. Render text to strokes */
+    int strokes = render_text_to_json(answer, RENDER_OUT_PATH,
+                                       -550.0f, (float)reply_y, FONT_PATH);
+    free(answer);
+
+    if (strokes <= 0) {
+        log_msg("Pipeline: render failed\n");
+        return;
+    }
+    log_msg("Pipeline: rendered %d strokes\n", strokes);
+
+    /* 8. Inject strokes */
+    char *json = NULL;
+    long fsize = 0;
+    if (load_file(RENDER_OUT_PATH, &json, &fsize) != 0) {
+        log_msg("Pipeline: cannot read rendered JSON\n");
+        return;
+    }
+
+    pthread_mutex_lock(&g_inject_lock);
+    int drawn = do_draw(g_dev_fd, json, 3000);  /* 3ms per point */
+    pthread_mutex_unlock(&g_inject_lock);
+    free(json);
+
+    log_msg("Pipeline: drew %d strokes, done\n", drawn);
+
+    /* Signal thinking indicator OFF */
+    unlink(THINKING_PATH);
+}
+
 /* ─── main loop ──────────────────────────────────────────────────── */
 
 int main(int argc, char **argv) {
@@ -1144,8 +1259,12 @@ int main(int argc, char **argv) {
 
     log_msg("Started (pid %d)\n", getpid());
 
-    int armed = read_armed_state();
-    log_msg("Initial armed state: %d\n", armed);
+    /* Always start disarmed — require explicit toggle each session */
+    int armed = 0;
+    log_msg("Initial armed state: 0 (forced)\n");
+
+    long long last_idle_ts = read_idle_ts();
+    log_msg("Initial idle ts: %lld\n", last_idle_ts);
 
     while (g_running) {
         /* Check armed state */
@@ -1153,6 +1272,25 @@ int main(int argc, char **argv) {
         if (new_armed != armed) {
             armed = new_armed;
             log_msg("Armed state changed: %d\n", armed);
+            if (armed) {
+                /* Reset idle baseline so we don't fire on stale signal */
+                last_idle_ts = read_idle_ts();
+                /* Start 5s safe zone */
+                FILE *sf = fopen(SAFEZONE_PATH, "w");
+                if (sf) { fputs("1\n", sf); fclose(sf); }
+                g_safezone_until = time(NULL) + 10;
+                log_msg("Safe zone active for 10s\n");
+            } else {
+                unlink(SAFEZONE_PATH);
+                g_safezone_until = 0;
+            }
+        }
+
+        /* Check safe zone expiry */
+        if (g_safezone_until > 0 && time(NULL) >= g_safezone_until) {
+            g_safezone_until = 0;
+            unlink(SAFEZONE_PATH);
+            log_msg("Safe zone expired\n");
         }
 
         if (!armed) {
@@ -1160,27 +1298,35 @@ int main(int argc, char **argv) {
             continue;
         }
 
-        /* When armed: check for pending command */
+        /* When armed: check for pending manual command first */
         struct stat st;
         if (stat(CMD_PATH, &st) == 0 && st.st_size > 0) {
             char *cmd_buf = NULL;
             long cmd_size = 0;
             if (load_file(CMD_PATH, &cmd_buf, &cmd_size) == 0 && cmd_size > 0) {
-                /* Strip trailing newline */
                 while (cmd_size > 0 && (cmd_buf[cmd_size-1] == '\n' || cmd_buf[cmd_size-1] == '\r'))
                     cmd_buf[--cmd_size] = '\0';
-
                 if (cmd_size > 0) {
                     log_msg("Processing command: %s\n", cmd_buf);
                     handle_command(cmd_buf);
                 }
                 free(cmd_buf);
             }
-            /* Remove the command file so we don't re-execute */
             unlink(CMD_PATH);
+            continue;  /* Don't also run pipeline this cycle */
         }
 
-        usleep(100000);  /* Poll every 100ms when armed */
+        /* Check for new idle signal → trigger pipeline (skip during safe zone) */
+        long long cur_idle_ts = read_idle_ts();
+        if (cur_idle_ts > 0 && cur_idle_ts != last_idle_ts && g_safezone_until == 0) {
+            last_idle_ts = cur_idle_ts;
+            log_msg("Idle detected (ts=%lld), running pipeline\n", cur_idle_ts);
+            run_pipeline();
+            /* After pipeline, update idle baseline to avoid re-trigger */
+            last_idle_ts = read_idle_ts();
+        }
+
+        usleep(200000);  /* Poll every 200ms when armed */
     }
 
     close(g_dev_fd);

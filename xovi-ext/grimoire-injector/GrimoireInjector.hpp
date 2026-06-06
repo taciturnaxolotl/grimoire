@@ -3,6 +3,7 @@
 #include <QObject>
 #include <QString>
 #include <QList>
+#include <QQuickItem>
 #include <memory>
 #include <atomic>
 #include "rm_SceneItem.hpp"
@@ -11,6 +12,7 @@
 class GrimoireInjector : public QObject {
     Q_OBJECT
     Q_PROPERTY(bool armed READ isArmed WRITE setArmed NOTIFY armedChanged)
+    Q_PROPERTY(bool thinking READ isThinking WRITE setThinking NOTIFY thinkingChanged)
 public:
     explicit GrimoireInjector(QObject *parent = nullptr);
 
@@ -22,8 +24,15 @@ public:
     bool isArmed() const { return m_armed; }
     void setArmed(bool armed);
 
+    bool isThinking() const { return m_thinking; }
+    void setThinking(bool thinking);
+
+    bool isSafezone() const { return m_safezone; }
+    void setSafezone(bool safezone);
+
 signals:
     void armedChanged(bool armed);
+    void thinkingChanged(bool thinking);
 
 public slots:
     void loadAndInject();
@@ -32,6 +41,10 @@ private:
     QList<std::shared_ptr<SceneItem>> m_items;
     bool m_vtableReady = false;
     bool m_armed = false;
+    bool m_thinking = false;
+    bool m_safezone = false;
+    QQuickItem *m_thinkingOverlay = nullptr;
+    QQuickItem *m_safezoneOverlay = nullptr;
     QString m_watchPath = "/tmp/grimoire_strokes.json";
     qint64 m_lastModTime = 0;
 };

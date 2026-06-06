@@ -1,0 +1,18 @@
+AFFECT [[11313888899523275277]]
+    IMPORT dev.grimoire.injector 0.1
+    TRAVERSE [[8397993708429497603]] > [[6502786168]]#[[233745975898428]]
+        LOCATE BEFORE [[8398044571386570029]]
+        INSERT {
+            BusyIndicator {
+                id: grimoireThinkingIndicator
+                visible: GrimoireInjector.thinking
+                running: GrimoireInjector.thinking
+                anchors.horizontalCenter: parent.horizontalCenter
+                anchors.bottom: parent.bottom
+                anchors.bottomMargin: 100
+                width: 60
+                height: 60
+            }
+        }
+    END TRAVERSE
+END AFFECT
