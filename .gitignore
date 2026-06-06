@@ -31,3 +31,4 @@ analysis/hashtab
 frida-explore.js
 
 .env
+.DS_Store

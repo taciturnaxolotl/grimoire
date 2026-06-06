@@ -192,12 +192,19 @@ static int do_draw(int fd, const char *json, int delay_us) {
         emit_event(fd, EV_ABS, ABS_DISTANCE, 86);
         emit_syn(fd);
         emit_event(fd, EV_KEY, BTN_TOUCH, 0);
+        emit_syn(fd);
+        usleep(8000);
+        /* Fully leave proximity so the device commits this stroke and won't
+         * connect it to the next one. Max out distance, drop the tool, and
+         * pause long enough for the stroke tracker to finalize before the
+         * next stroke's hover-down begins. */
+        emit_event(fd, EV_ABS, ABS_DISTANCE, 255);
         emit_event(fd, EV_KEY, BTN_TOOL_PEN, 0);
         emit_syn(fd);
 
         stroke_count++;
         vlog("Stroke %d: %d points\n", stroke_count, point_count);
-        usleep(50000);
+        usleep(60000);
     }
     return stroke_count;
 }
@@ -303,31 +310,34 @@ static int do_swipe_page(void) {
 
     /* Right-to-left swipe across bottom third of screen (next page).
      * Touch coords match display: X 0-1403, Y 0-1871.
-     * Swipe from (1200, 1400) to (200, 1400) in ~20 steps. */
+     * Swipe from (1200, 1400) to (200, 1400) in ~20 steps.
+     * Protocol matches real pt_mt device: no ABS_MT_SLOT in frames,
+     * tracking_id only on first/last, touch_major after a few frames. */
     const int x0 = 1200, x1 = 200, y = 1400;
     const int steps = 20;
     const int step_delay = 8000;  /* 8ms per step = ~160ms total */
 
-    /* Slot 0, tracking ID 1 */
-    emit_event(fd, EV_ABS, ABS_MT_SLOT, 0);
-    emit_event(fd, EV_ABS, ABS_MT_TRACKING_ID, 1);
+    /* First frame: tracking_id + position + pressure */
+    emit_event(fd, EV_ABS, ABS_MT_TRACKING_ID, 9999);
     emit_event(fd, EV_ABS, ABS_MT_POSITION_X, x0);
     emit_event(fd, EV_ABS, ABS_MT_POSITION_Y, y);
-    emit_event(fd, EV_ABS, ABS_MT_PRESSURE, 128);
+    emit_event(fd, EV_ABS, ABS_MT_PRESSURE, 100);
     emit_syn(fd);
     usleep(step_delay);
 
     for (int i = 1; i <= steps; i++) {
         int cx = x0 + (x1 - x0) * i / steps;
-        emit_event(fd, EV_ABS, ABS_MT_SLOT, 0);
         emit_event(fd, EV_ABS, ABS_MT_POSITION_X, cx);
-        emit_event(fd, EV_ABS, ABS_MT_POSITION_Y, y);
+        emit_event(fd, EV_ABS, ABS_MT_PRESSURE, 100);
+        if (i == 3) {
+            /* Add touch_major after a few frames like real hardware */
+            emit_event(fd, EV_ABS, ABS_MT_TOUCH_MAJOR, 17);
+        }
         emit_syn(fd);
         usleep(step_delay);
     }
 
-    /* Release: tracking ID = -1 */
-    emit_event(fd, EV_ABS, ABS_MT_SLOT, 0);
+    /* Release: tracking_id = -1 */
     emit_event(fd, EV_ABS, ABS_MT_TRACKING_ID, -1);
     emit_syn(fd);
 
@@ -499,6 +509,29 @@ static void serve_client(int client_fd) {
     int one = 1;
     setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 
+    /* TCP keepalive: detect dead clients even if they didn't close cleanly.
+     * After 30s idle, probe every 10s, give up after 3 missed probes. */
+    setsockopt(client_fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
+#ifdef TCP_KEEPIDLE
+    int keepidle = 30;
+    setsockopt(client_fd, IPPROTO_TCP, TCP_KEEPIDLE, &keepidle, sizeof(keepidle));
+#endif
+#ifdef TCP_KEEPINTVL
+    int keepintvl = 10;
+    setsockopt(client_fd, IPPROTO_TCP, TCP_KEEPINTVL, &keepintvl, sizeof(keepintvl));
+#endif
+#ifdef TCP_KEEPCNT
+    int keepcnt = 3;
+    setsockopt(client_fd, IPPROTO_TCP, TCP_KEEPCNT, &keepcnt, sizeof(keepcnt));
+#endif
+
+    /* Read timeout: if no data for 15s, assume client is dead.
+     * Python sends pings every 5s, so 15s gives 3 missed pings. */
+    struct timeval tv;
+    tv.tv_sec = 15;
+    tv.tv_usec = 0;
+    setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
     /* Spawn idle watcher for this session */
     pthread_t watcher;
     pthread_create(&watcher, NULL, idle_watch_thread, NULL);
@@ -513,7 +546,15 @@ static void serve_client(int client_fd) {
 
     while (1) {
         ssize_t n = read(client_fd, buf, sizeof(buf));
-        if (n <= 0) break;  /* client disconnected */
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                vlog("Read timeout, client assumed dead\n");
+                break;
+            }
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (n == 0) break;  /* client disconnected cleanly */
 
         /* Accumulate into lines (newline-delimited framing) */
         for (ssize_t i = 0; i < n; i++) {

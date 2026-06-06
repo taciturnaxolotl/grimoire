@@ -82,7 +82,25 @@ class DeviceClient:
         self._connected = True
         self._reader = _threading.Thread(target=self._read_loop, daemon=True)
         self._reader.start()
+        # Heartbeat: the daemon drops a client that sends nothing for 15s
+        # (its SO_RCVTIMEO). Pushed idle events flow daemon->client and don't
+        # count as client activity, so we must send a ping periodically even
+        # while idle, or the daemon silently disconnects us mid-wait.
+        self._hb = _threading.Thread(target=self._heartbeat_loop, daemon=True)
+        self._hb.start()
         print(f"[device] Connected to uinjectd at {self.host}:{self.port}")
+
+    def _heartbeat_loop(self):
+        """Send a ping every 5s so the daemon's read-timeout never fires."""
+        while self._connected:
+            time.sleep(5)
+            if not self._connected:
+                break
+            try:
+                self.sock.sendall(b'{"cmd":"ping"}\n')
+            except OSError:
+                self._connected = False
+                break
 
     def _read_loop(self):
         """Demux framed JSON lines into responses vs pushed events."""
@@ -106,6 +124,11 @@ class DeviceClient:
                 if "event" in msg:
                     self.events.put(msg)
                 elif "resp" in msg:
+                    # Heartbeat ping replies are fire-and-forget; dropping
+                    # them keeps the one-slot reply box clear for the real
+                    # command (draw/erase) that command() is waiting on.
+                    if msg.get("resp") == "ping":
+                        continue
                     if self._reply.full():
                         try:
                             self._reply.get_nowait()
@@ -160,22 +183,17 @@ def run_inject(ssh, cmd, file_path, speed_ms=5, timeout=120):
 
 
 def ensure_daemon(ssh, verbose=False):
-    """Make sure uinjectd is running on the device, starting it if not.
+    """Make sure uinjectd is running on the device.
 
-    The daemon dies with xochitl (shared process tree), so on a fresh
-    run it may be gone. We check the listening port and relaunch over
-    SSH if needed — startup is self-healing rather than crash-on-connect.
+    Always kills and restarts to avoid stale connection state. The daemon
+    is lightweight (~50KB RSS) and starts in <100ms, so this is cheap.
+    A stale daemon can hold the TCP port while being unable to serve new
+    clients (e.g., stuck in read() from a dead session), and probing for
+    liveness creates its own race with the single-client accept loop.
     """
-    check = ssh.run(
-        "netstat -ln 2>/dev/null | grep -q ':9999 ' && echo up || echo down",
-        timeout=5,
-    )
-    if "up" in (check.stdout or ""):
-        return
-    print("[device] uinjectd not running, starting it...")
     vflag = "-v " if verbose else ""
     ssh.run(
-        f"killall uinjectd 2>/dev/null; "
+        f"killall uinjectd 2>/dev/null; sleep 0.3; "
         f"nohup /home/root/uinjectd {vflag}> /tmp/uinjectd.log 2>&1 &",
         timeout=5,
     )
@@ -210,10 +228,13 @@ class SSHSession:
         """Establish master connection."""
         # Clean up any stale socket from a previous run
         if os.path.exists(self.socket):
-            subprocess.run(
-                ["ssh", "-o", f"ControlPath={self.socket}", "-O", "exit", self.host],
-                capture_output=True, timeout=5,
-            )
+            try:
+                subprocess.run(
+                    ["ssh", "-o", f"ControlPath={self.socket}", "-O", "exit", self.host],
+                    capture_output=True, timeout=3,
+                )
+            except subprocess.TimeoutExpired:
+                pass  # stale master is hung, just remove the socket
             try:
                 os.unlink(self.socket)
             except OSError:
@@ -566,8 +587,28 @@ def render_and_inject(ssh, text, reply_y=None, speed_ms=3):
 # ─── Idle watching ────────────────────────────────────────────────
 
 
+def _densify_rm(poly, max_seg_len=40.0):
+    """Subdivide a polyline so no segment exceeds max_seg_len (rm units).
+
+    The reMarkable stroke renderer mangles long 2-point segments — it
+    interprets the gap as a curve or extends the endpoints. Inserting
+    intermediate points keeps straight lines straight.
+    """
+    if len(poly) < 2:
+        return poly
+    out = [poly[0]]
+    for (x0, y0), (x1, y1) in zip(poly, poly[1:]):
+        dx, dy = x1 - x0, y1 - y0
+        dist = (dx * dx + dy * dy) ** 0.5
+        n = max(1, int(dist / max_seg_len))
+        for k in range(1, n + 1):
+            t = k / n
+            out.append((x0 + dx * t, y0 + dy * t))
+    return out
+
+
 def _scp_thinking_swirl(ssh):
-    """Parse border-top-right.svg into corner ornament strokes for the
+    """Parse border_top_right_stroke.svg into corner ornament strokes for the
     thinking indicator. Falls back to a simple spiral if file is absent.
 
     Done once at startup — the animation thread just fires draw/erase
@@ -576,16 +617,31 @@ def _scp_thinking_swirl(ssh):
     import math
     import xml.etree.ElementTree as ET
 
-    def _cubicbez(p0, p1, p2, p3, n=4):
-        pts = []
-        for i in range(n + 1):
-            t = i / n
-            mt = 1 - t
-            pts.append((
-                mt**3*p0[0] + 3*mt**2*t*p1[0] + 3*mt*t**2*p2[0] + t**3*p3[0],
-                mt**3*p0[1] + 3*mt**2*t*p1[1] + 3*mt*t**2*p2[1] + t**3*p3[1],
-            ))
-        return pts
+    def _cubicbez(p0, p1, p2, p3, tolerance=0.05):
+        """Adaptive bezier subdivision: more points where curvature is high."""
+        def _subdivide(a, b, c, d, tol):
+            # Flatness test: max distance of control points from chord a→d
+            dx, dy = d[0]-a[0], d[1]-a[1]
+            chord_len_sq = dx*dx + dy*dy
+            if chord_len_sq < 1e-8:
+                return [a, d]
+            # Perpendicular distances of b and c from the chord
+            inv_len = 1.0 / (chord_len_sq ** 0.5)
+            dist_b = abs((b[0]-a[0])*dy - (b[1]-a[1])*dx) * inv_len
+            dist_c = abs((c[0]-a[0])*dy - (c[1]-a[1])*dx) * inv_len
+            if max(dist_b, dist_c) <= tol:
+                return [a, d]
+            # De Casteljau split at t=0.5
+            ab = ((a[0]+b[0])/2, (a[1]+b[1])/2)
+            bc = ((b[0]+c[0])/2, (b[1]+c[1])/2)
+            cd = ((c[0]+d[0])/2, (c[1]+d[1])/2)
+            abc = ((ab[0]+bc[0])/2, (ab[1]+bc[1])/2)
+            bcd = ((bc[0]+cd[0])/2, (bc[1]+cd[1])/2)
+            mid = ((abc[0]+bcd[0])/2, (abc[1]+bcd[1])/2)
+            left = _subdivide(a, ab, abc, mid, tol)
+            right = _subdivide(mid, bcd, cd, d, tol)
+            return left[:-1] + right
+        return _subdivide(p0, p1, p2, p3, tolerance)
 
     def _parse_d(d):
         """SVG path d string → list of polylines (handles M L C Z)."""
@@ -612,6 +668,8 @@ def _scp_thinking_swirl(ssh):
                     cur.append(p)
                 cx, cy = x, y; i += 6
             elif cmd in ('Z', 'z'):
+                # Don't close path — for stroke ornaments, Z would retrace
+                # back to start and create overlapping lines. Just end the polyline.
                 if cur: polylines.append(cur)
                 cur = []
             else:
@@ -620,51 +678,139 @@ def _scp_thinking_swirl(ssh):
             polylines.append(cur)
         return polylines
 
-    svg_file = Path(__file__).parent / "border-top-right.svg"
+    def _parse_matrix(s):
+        """Parse 'matrix(a,b,c,d,e,f)' into (a,b,c,d,e,f) tuple."""
+        m = re.match(r'matrix\(([^)]+)\)', s.strip())
+        if not m:
+            return (1, 0, 0, 1, 0, 0)
+        vals = [float(v.strip()) for v in m.group(1).split(',')]
+        return tuple(vals) if len(vals) == 6 else (1, 0, 0, 1, 0, 0)
+
+    def _compose(m1, m2):
+        """Compose two (a,b,c,d,e,f) matrices: apply m2 then m1."""
+        a1,b1,c1,d1,e1,f1 = m1
+        a2,b2,c2,d2,e2,f2 = m2
+        return (
+            a1*a2 + c1*b2, b1*a2 + d1*b2,
+            a1*c2 + c1*d2, b1*c2 + d1*d2,
+            a1*e2 + c1*f2 + e1, b1*e2 + d1*f2 + f1,
+        )
+
+    def _apply(m, x, y):
+        """Apply matrix (a,b,c,d,e,f) to point (x,y)."""
+        a,b,c,d,e,f = m
+        return a*x + c*y + e, b*x + d*y + f
+
+    def _centerline(poly):
+        """Extract centerline from a closed outline path.
+
+        Outline paths trace one edge then return along the other.
+        Split at the midpoint and average corresponding points from
+        each half to get the center stroke.
+        """
+        n = len(poly)
+        if n < 4:
+            return poly
+        # Check if it's actually closed (start ≈ end)
+        dx = poly[0][0] - poly[-1][0]
+        dy = poly[0][1] - poly[-1][1]
+        if dx*dx + dy*dy > 4.0:
+            return poly  # not closed, use as-is
+        # Remove duplicate closing point
+        pts = poly[:-1]
+        n = len(pts)
+        half = n // 2
+        center = []
+        for i in range(half):
+            j = n - 1 - i  # mirror index from second half
+            cx = (pts[i][0] + pts[j][0]) / 2
+            cy = (pts[i][1] + pts[j][1]) / 2
+            center.append((cx, cy))
+        return center
+
+    svg_file = Path(__file__).parent / "border-top-right-centerline.svg"
     strokes = []
 
     if svg_file.exists():
         tree = ET.parse(str(svg_file))
         root = tree.getroot()
         ns = {'svg': 'http://www.w3.org/2000/svg'}
-        # Group transform in the SVG: matrix(1,0,0,1,-215.007869,-426.567829)
-        tx, ty = -215.007869, -426.567829
 
+        # Collect all paths with their composed transform matrices.
         all_polys = []
-        for el in (root.findall('.//svg:path', ns) or root.findall('.//path')):
-            for poly in _parse_d(el.attrib.get('d', '')):
-                all_polys.append([(x + tx, y + ty) for x, y in poly])
+
+        def _walk(el, parent_mat):
+            mat = parent_mat
+            t = el.attrib.get('transform')
+            if t:
+                mat = _compose(parent_mat, _parse_matrix(t))
+            tag = el.tag.split('}')[-1] if '}' in el.tag else el.tag
+            if tag == 'path':
+                d = el.attrib.get('d', '')
+                for poly in _parse_d(d):
+                    transformed = [_apply(mat, x, y) for x, y in poly]
+                    all_polys.append(transformed)
+            for child in el:
+                _walk(child, mat)
+
+        _walk(root, (1, 0, 0, 1, 0, 0))
 
         if all_polys:
-            # After the group translate the SVG occupies ~[0,173]×[0,155].
-            # The design is a top-right corner: spirals at (173,0), horizontal
-            # bar extending left, vertical bar extending down.
-            # Map it to all four corners of the reMarkable page, then interleave
-            # strokes from each corner in round-robin so they appear to grow
-            # simultaneously.
-            # rm coords: x ∈ [-702, 702], y ∈ [0, 1872] top-to-bottom.
-            svg_w, svg_h = 173.0, 155.0
+            # Use viewBox for accurate origin/dimensions (point-based bounds
+            # can miss negative coords or padding the designer intended).
+            vb = root.attrib.get('viewBox')
+            if vb:
+                parts = [float(v) for v in vb.replace(',', ' ').split()]
+                ox, oy, svg_w, svg_h = parts
+            else:
+                all_x = [p[0] for poly in all_polys for p in poly]
+                all_y = [p[1] for poly in all_polys for p in poly]
+                svg_w = max(all_x) - min(all_x)
+                svg_h = max(all_y) - min(all_y)
+                ox, oy = min(all_x), min(all_y)
 
-            # (flip_x, flip_y, rm_x_min, rm_x_max, rm_y_min, rm_y_max)
-            # Outer edge 30 units from each page edge; boxes are 400×380 so
-            # the ornaments read clearly and fill their corners with presence.
+            # rm coords: x ∈ [-702, 702], y ∈ [0, 1872] top-to-bottom.
             corners = [
-                (False, False,  182,  682,   20,  400),  # top-right
-                (True,  False, -682, -182,   20,  400),  # top-left
-                (False, True,   182,  682, 1472, 1852),  # bottom-right
-                (True,  True,  -682, -182, 1472, 1852),  # bottom-left
+                (False, False,  132,  632,   50,  430),  # top-right
+                (True,  False, -632, -132,   50,  430),  # top-left
+                (False, True,   132,  632, 1442, 1822),  # bottom-right
+                (True,  True,  -632, -132, 1442, 1822),  # bottom-left
             ]
 
             def make_strokes(polys, flip_x, flip_y, rx0, rx1, ry0, ry1):
+                box_w = rx1 - rx0
+                box_h = ry1 - ry0
+                # Uniform scale: fit SVG into box preserving aspect ratio
+                scale = min(box_w / svg_w, box_h / svg_h)
+                # Anchor to the corner instead of centering. The SVG is drawn
+                # hugging the top-right of its own viewBox (scrolls at top,
+                # vertical bar on the right edge), so before any flip we push
+                # the leftover slack to the left/bottom — keeping the ornament
+                # tight against the corner rather than floating inward.
+                margin_x = box_w - svg_w * scale
+                margin_y = 0.0
+
                 def to_rm(sx, sy):
-                    fx = ((svg_w - sx) if flip_x else sx) / svg_w
-                    fy = ((svg_h - sy) if flip_y else sy) / svg_h
-                    return rx0 + fx * (rx1 - rx0), ry0 + fy * (ry1 - ry0)
+                    # Position relative to SVG origin, scaled and centered
+                    nx = (sx - ox) * scale + margin_x
+                    ny = (sy - oy) * scale + margin_y
+                    # Apply flip
+                    if flip_x:
+                        nx = box_w - nx
+                    if flip_y:
+                        ny = box_h - ny
+                    return rx0 + nx, ry0 + ny
                 result = []
                 for poly in polys:
                     if len(poly) < 2:
                         continue
-                    pts = [[*to_rm(x, y), 6, 11, 90, 170] for x, y in poly]
+                    rm_poly = [to_rm(x, y) for x, y in poly]
+                    # Densify: the device stroke renderer mangles long
+                    # 2-point segments (the straight bars), interpreting the
+                    # big gap as a curve or extending the endpoints. Subdivide
+                    # so every segment is short and renders as a clean line.
+                    dense = _densify_rm(rm_poly, max_seg_len=40.0)
+                    pts = [[px, py, 6, 11, 90, 170] for px, py in dense]
                     xs = [p[0] for p in pts]; ys = [p[1] for p in pts]
                     result.append({
                         'points': pts,
@@ -712,10 +858,19 @@ def watch_for_idle(device, last_ts):
 
     The daemon watches /tmp/grimoire_idle locally and pushes an event
     the instant it changes — no host-side polling. Returns the new
-    timestamp.
+    timestamp. Raises ConnectionError if the socket dies.
     """
     while True:
-        msg = device.events.get()  # blocks on the pushed-event queue
+        try:
+            msg = device.events.get(timeout=5)
+        except _queue.Empty:
+            # No events recently. The heartbeat thread keeps the socket
+            # alive and flips _connected to False if it dies, so we just
+            # check that flag rather than sending our own ping (whose reply
+            # is intentionally dropped by the reader).
+            if not device._connected:
+                raise ConnectionError("uinjectd connection lost")
+            continue
         if msg.get("event") == "idle":
             ts = msg.get("ts")
             if ts != last_ts:
@@ -874,15 +1029,35 @@ def main():
     # On connect the daemon pushes "ready" plus the current idle file
     # value. Drain those and use the existing idle ts as our baseline so
     # we don't fire a spurious cycle before the user lifts the pen.
+    # Also verify the connection is actually alive (reader thread didn't die).
     last_idle_ts = None
-    deadline = time.time() + 1.0
+    deadline = time.time() + 2.0
+    got_ready = False
     while time.time() < deadline:
         try:
             msg = _device.events.get(timeout=0.3)
         except _queue.Empty:
-            break
-        if msg.get("event") == "idle":
+            continue  # keep waiting until deadline, don't break early
+        if msg.get("event") == "ready":
+            got_ready = True
+        elif msg.get("event") == "idle":
             last_idle_ts = msg.get("ts")
+
+    if not got_ready or not _device._connected:
+        print("[device] Initial connection failed, retrying...")
+        _device.close()
+        time.sleep(1)
+        ensure_daemon(ssh, verbose=args.verbose)
+        _device = DeviceClient()
+        _device.connect()
+        deadline = time.time() + 2.0
+        while time.time() < deadline:
+            try:
+                msg = _device.events.get(timeout=0.3)
+            except _queue.Empty:
+                continue
+            if msg.get("event") == "idle":
+                last_idle_ts = msg.get("ts")
 
     # The thinking swirl is static — generate it once and SCP it to the
     # device so the daemon can draw/erase it on demand over the socket.
@@ -900,7 +1075,43 @@ def main():
     try:
         while True:
             # Wait for pushed idle event (no polling)
-            new_ts = watch_for_idle(_device, last_idle_ts)
+            try:
+                new_ts = watch_for_idle(_device, last_idle_ts)
+            except ConnectionError as e:
+                print(f"[{_ts()}] Connection lost ({e}), reconnecting...")
+                try:
+                    _device.close()
+                except Exception:
+                    pass
+                for attempt in range(5):
+                    time.sleep(2)
+                    try:
+                        # Recreate SSH session in case the master died
+                        try:
+                            ssh.close()
+                        except Exception:
+                            pass
+                        ssh = SSHSession("remarkable")
+                        ensure_daemon(ssh, verbose=False)
+                        _device = DeviceClient()
+                        _device.connect()
+                        # Drain initial events
+                        deadline = time.time() + 2.0
+                        while time.time() < deadline:
+                            try:
+                                msg = _device.events.get(timeout=0.3)
+                            except _queue.Empty:
+                                continue
+                            if msg.get("event") == "idle":
+                                last_idle_ts = msg.get("ts")
+                        print(f"[{_ts()}] Reconnected (attempt {attempt+1})")
+                        break
+                    except Exception as re_err:
+                        print(f"[{_ts()}] Reconnect attempt {attempt+1} failed: {re_err}")
+                else:
+                    print(f"[{_ts()}] ERROR: could not reconnect after 5 attempts")
+                    time.sleep(10)
+                continue
             last_idle_ts = new_ts
 
             t0 = time.time()

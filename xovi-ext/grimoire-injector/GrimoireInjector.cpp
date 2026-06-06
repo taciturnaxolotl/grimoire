@@ -412,6 +412,7 @@ bool PenIdleWatcher::eventFilter(QObject * /*obj*/, QEvent *event) {
         m_penDown = false;
         m_lastLiftMs = nowMs();
         m_lastActivityMs = nowMs();  // lift also counts as activity
+        grimoire_log("Pen up (lift)");
     }
     return false;
 }
@@ -422,6 +423,16 @@ void *PenIdleWatcher::debounceThreadFunc(void *arg) {
 
     while (self->m_running) {
         long long activity = self->m_lastActivityMs.load();
+        // Safety: if m_penDown has been stuck true for 30s+ with no new
+        // activity, force it false. A missed release event would otherwise
+        // permanently stall the debounce.
+        if (self->m_penDown.load() && activity > 0) {
+            long long stuck = nowMs() - activity;
+            if (stuck > 30000) {
+                self->m_penDown = false;
+                grimoire_log("Pen down stuck for %lldms, forcing lift", stuck);
+            }
+        }
         // Only fire when the pen is currently up AND the page has been
         // completely quiet (no down or up events) for the full window.
         // Any new stroke updates m_lastActivityMs and resets the count.
@@ -443,6 +454,8 @@ void PenIdleWatcher::writeIdleSignal() {
         long long ts = nowMs();
         fprintf(fp, "%lld\n", ts);
         fclose(fp);
-        fprintf(stderr, "[grimoire] Idle signal written (pen up for %dms)\n", DEBOUNCE_MS);
+        grimoire_log("Idle signal written (ts=%lld)", ts);
+    } else {
+        grimoire_log("ERROR: failed to write %s", IDLE_PATH);
     }
 }
