@@ -145,7 +145,24 @@ static int do_draw(int fd, const char *json, int delay_us) {
         if (!p) break;
         p++;
 
-        emit_event(fd, EV_KEY, BTN_TOOL_PEN, 1);
+        /* Peek first point for hover frame */
+        float hx, hy;
+        int hs, hw, hd, hp;
+        if (sscanf(p, "[%f,%f,%d,%d,%d,%d]", &hx, &hy, &hs, &hw, &hd, &hp) == 6) {
+            int hwx, hwy;
+            rm_to_wacom(hx, hy, &hwx, &hwy);
+            emit_event(fd, EV_KEY, BTN_TOOL_PEN, 1);
+            emit_event(fd, EV_ABS, ABS_X, hwx);
+            emit_event(fd, EV_ABS, ABS_Y, hwy);
+            emit_event(fd, EV_ABS, ABS_DISTANCE, 60);
+            emit_syn(fd);
+            usleep(2000);
+        } else {
+            emit_event(fd, EV_KEY, BTN_TOOL_PEN, 1);
+            emit_event(fd, EV_ABS, ABS_DISTANCE, 60);
+            emit_syn(fd);
+            usleep(2000);
+        }
         emit_event(fd, EV_KEY, BTN_TOUCH, 1);
 
         int point_count = 0;
@@ -202,7 +219,26 @@ static int do_erase(int fd, const char *json, int delay_us) {
             if (!p) break;
             p++;
 
-            emit_event(fd, EV_KEY, BTN_TOOL_RUBBER, 1);
+            /* Peek first point for hover frame */
+            float hx, hy;
+            int hs, hw, hd, hp;
+            char *saved_p = p;
+            if (sscanf(p, "[%f,%f,%d,%d,%d,%d]", &hx, &hy, &hs, &hw, &hd, &hp) == 6) {
+                int hwx, hwy;
+                rm_to_wacom(hx + ox, hy + oy, &hwx, &hwy);
+                emit_event(fd, EV_KEY, BTN_TOOL_RUBBER, 1);
+                emit_event(fd, EV_ABS, ABS_X, hwx);
+                emit_event(fd, EV_ABS, ABS_Y, hwy);
+                emit_event(fd, EV_ABS, ABS_DISTANCE, 60);
+                emit_syn(fd);
+                usleep(2000);
+            } else {
+                emit_event(fd, EV_KEY, BTN_TOOL_RUBBER, 1);
+                emit_event(fd, EV_ABS, ABS_DISTANCE, 60);
+                emit_syn(fd);
+                usleep(2000);
+            }
+            p = saved_p;
             emit_event(fd, EV_KEY, BTN_TOUCH, 1);
 
             int bracket_depth = 1;

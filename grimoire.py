@@ -18,38 +18,31 @@ from io import BytesIO
 from pathlib import Path
 from typing import Optional
 
-from rmscene import (
-    CrdtId,
-    CrdtSequenceItem,
-    LwwValue,
-    read_blocks,
-    write_blocks,
-    scene_items as si,
-)
-from rmscene.scene_stream import (
-    SceneLineItemBlock,
-    SceneTreeBlock,
-    TreeNodeBlock,
-    SceneGroupItemBlock,
-)
+from rmscene import CrdtId, CrdtSequenceItem, LwwValue, read_blocks
+from rmscene import scene_items as si
+from rmscene import write_blocks
+from rmscene.scene_stream import (SceneGroupItemBlock, SceneLineItemBlock,
+                                  SceneTreeBlock, TreeNodeBlock)
+from svgpathtools import Line as SvgLine
+from svgpathtools import parse_path
 
 
 def parse_svg_font(path: str) -> tuple[dict, dict[str, float]]:
     tree = ET.parse(path)
     root_e = tree.getroot()
-    ns = {'svg': 'http://www.w3.org/2000/svg'}
-    font_elem = root_e.find('.//svg:font', ns) or root_e.find('.//font')
+    ns = {"svg": "http://www.w3.org/2000/svg"}
+    font_elem = root_e.find(".//svg:font", ns) or root_e.find(".//font")
     if font_elem is None:
         raise ValueError(f"Missing <font> in {path}")
-    default_adv = float(font_elem.attrib.get('horiz-adv-x', 500))
+    default_adv = float(font_elem.attrib.get("horiz-adv-x", 500))
     glyphs = {}
-    advances = {' ': default_adv}
-    for g in font_elem.findall('svg:glyph', ns) or font_elem.findall('glyph'):
-        uni = g.attrib.get('unicode')
+    advances = {" ": default_adv}
+    for g in font_elem.findall("svg:glyph", ns) or font_elem.findall("glyph"):
+        uni = g.attrib.get("unicode")
         if not uni:
             continue
-        advances[uni] = float(g.attrib.get('horiz-adv-x', default_adv))
-        d = g.attrib.get('d', '')
+        advances[uni] = float(g.attrib.get("horiz-adv-x", default_adv))
+        d = g.attrib.get("d", "")
         if d:
             glyphs[uni] = _parse_d(d)
         else:
@@ -57,37 +50,30 @@ def parse_svg_font(path: str) -> tuple[dict, dict[str, float]]:
     return glyphs, advances
 
 
-def _parse_d(d: str) -> list[list[tuple[float, float]]]:
-    polylines = []
-    current = []
-    tokens = d.replace(',', ' ').split()
-    i = 0
-    while i < len(tokens):
-        cmd = tokens[i]
-        if cmd in ('M', 'L'):
-            i += 1
-            if i + 1 >= len(tokens):
-                break
-            x, y = float(tokens[i]), float(tokens[i+1])
-            i += 2
-            if cmd == 'M':
-                if len(current) >= 2:
-                    polylines.append(current)
-                current = [(x, y)]
-            else:
-                current.append((x, y))
-        elif cmd in ('C', 'Q'):
-            # skip bezier control points in batch
-            i += 1
-            while i < len(tokens) and tokens[i] not in ('M', 'L', 'C', 'Q', 'Z', 'z'):
-                i += 1
-            if current and len(current) >= 2:
-                current.append(current[0])
-            i += 1
-        else:
-            i += 1
-    if len(current) >= 2:
-        polylines.append(current)
+def _parse_d(d: str, samples_per_curve: int = 8) -> list[list[tuple[float, float]]]:
+    """Parse glyph path data into one polyline per continuous subpath.
+
+    Handles curves (C/Q/S/T), arcs, implicit repeated commands, and
+    relative coords by delegating to a real SVG path parser. Each
+    continuous run (between Move commands) becomes its own polyline =
+    its own .rm stroke, so separate strokes are never joined.
+    """
+    try:
+        path = parse_path(d)
+    except Exception:
+        return []
+    polylines: list[list[tuple[float, float]]] = []
+    for sub in path.continuous_subpaths():
+        pts: list[tuple[float, float]] = []
+        for seg in sub:
+            n = 1 if isinstance(seg, SvgLine) else samples_per_curve
+            for k in range(n + 1):
+                z = seg.point(k / n)
+                pt = (z.real, z.imag)
+                if not pts or pt != pts[-1]:  # dedupe shared segment endpoints
+                    pts.append(pt)
+        if len(pts) >= 2:
+            polylines.append(pts)
     return polylines
 
 
@@ -113,8 +99,8 @@ def _densify(
     return out
 
 
-_FONT_CACHE: Optional[tuple[dict, dict[str, float]]] = None
-DEFAULT_SCALE = 0.07
+_FONT_CACHE: dict = {}
+DEFAULT_SCALE = 0.06
 DEFAULT_X = -550.0
 DEFAULT_Y = 200.0
 LINE_HEIGHT = 1.4
@@ -122,13 +108,11 @@ MAX_LINE_WIDTH = 1100
 
 
 def load_font(name: str = "EMSAllure") -> tuple[dict, dict[str, float]]:
-    global _FONT_CACHE
-    if _FONT_CACHE is not None:
-        return _FONT_CACHE
-    font_dir = Path(__file__).parent / "fonts"
-    svg_path = font_dir / f"{name}.svg"
-    _FONT_CACHE = parse_svg_font(str(svg_path))
-    return _FONT_CACHE
+    if name not in _FONT_CACHE:
+        font_dir = Path(__file__).parent / "fonts"
+        svg_path = font_dir / f"{name}.svg"
+        _FONT_CACHE[name] = parse_svg_font(str(svg_path))
+    return _FONT_CACHE[name]
 
 
 def text_to_strokes(
@@ -138,13 +122,14 @@ def text_to_strokes(
     scale: float = DEFAULT_SCALE,
     max_width: float = MAX_LINE_WIDTH,
     line_spacing: float = LINE_HEIGHT,
+    font: str = "EMSAllure",
 ) -> list[si.Line]:
-    glyphs, advances = load_font()
+    glyphs, advances = load_font(font)
     result = []
     cursor_x = origin_x
     cursor_y = origin_y
     rng = random.Random(text + str(origin_x))
-    space_adv = advances.get(' ', 500) * scale
+    space_adv = advances.get(" ", 500) * scale
 
     for word in text.split():
         word_width = sum(advances.get(ch, 500) for ch in word) * scale
@@ -180,20 +165,25 @@ def text_to_strokes(
                     wobble = math.sin(cursor_x * 0.01 + j * 0.3) * 0.8
                     px = cursor_x + sx + x_jitter
                     py = cursor_y + sy + y_jitter + wobble
-                    points.append(si.Point(
-                        x=px, y=py,
-                        speed=4 + rng.randint(0, 8),
-                        direction=80 + rng.randint(0, 30),
-                        width=10 + rng.randint(0, 3),
-                        pressure=160 + rng.randint(0, 30),
-                    ))
-                result.append(si.Line(
-                    color=si.PenColor.BLACK,
-                    tool=si.Pen.BALLPOINT_2,
-                    points=points,
-                    thickness_scale=2.0,
-                    starting_length=0.0,
-                ))
+                    points.append(
+                        si.Point(
+                            x=px,
+                            y=py,
+                            speed=4 + rng.randint(0, 8),
+                            direction=80 + rng.randint(0, 30),
+                            width=10 + rng.randint(0, 3),
+                            pressure=160 + rng.randint(0, 30),
+                        )
+                    )
+                result.append(
+                    si.Line(
+                        color=si.PenColor.BLACK,
+                        tool=si.Pen.BALLPOINT_2,
+                        points=points,
+                        thickness_scale=2.0,
+                        starting_length=0.0,
+                    )
+                )
 
             cursor_x += adv + max(-2, x_jitter * 0.1) + abs(rng.uniform(-1, 1))
         cursor_x += space_adv + rng.uniform(-2, 2)
@@ -214,7 +204,7 @@ def _find_content_bottom(data: bytes) -> float:
             for block in read_blocks(f):
                 if isinstance(block, SceneLineItemBlock):
                     line = block.item.value
-                    if hasattr(line, 'points'):
+                    if hasattr(line, "points"):
                         for pt in line.points:
                             if pt.y > max_y:
                                 max_y = pt.y
@@ -230,6 +220,7 @@ def _find_content_bottom(data: bytes) -> float:
 def _find_last_root_child(data: bytes) -> CrdtId:
     """Find the last SceneGroupItemBlock value under root for left_id chaining."""
     from io import BytesIO
+
     ROOT = CrdtId(0, 1)
     last_value = CrdtId(0, 0)
     try:
@@ -260,7 +251,7 @@ def splice_reply_new_layer(
 
     # CRDT IDs — author 2 for programmatic content, starting at seq 500
     # to avoid collision with existing data (real Layer 2 uses ~422-427)
-    LAYER_TREE = CrdtId(2, 500)   # tree_id for the new layer
+    LAYER_TREE = CrdtId(2, 500)  # tree_id for the new layer
     ROOT = CrdtId(0, 1)
 
     # Find the last group item under root to chain left_id correctly
@@ -275,11 +266,13 @@ def splice_reply_new_layer(
     )
 
     # 2. Layer metadata: TreeNodeBlock with label and visibility
-    label_block = TreeNodeBlock(si.Group(
-        node_id=LAYER_TREE,
-        label=LwwValue(CrdtId(2, 501), "grimoire"),
-        visible=LwwValue(CrdtId(2, 502), True),
-    ))
+    label_block = TreeNodeBlock(
+        si.Group(
+            node_id=LAYER_TREE,
+            label=LwwValue(CrdtId(2, 501), "grimoire"),
+            visible=LwwValue(CrdtId(2, 502), True),
+        )
+    )
 
     # 3. Add layer to root's children list (SceneGroupItemBlock)
     group_item_block = SceneGroupItemBlock(
@@ -297,16 +290,18 @@ def splice_reply_new_layer(
 
     # 4. Line items parented to the layer tree_id
     for i, line in enumerate(strokes):
-        reply_blocks.append(SceneLineItemBlock(
-            parent_id=LAYER_TREE,
-            item=CrdtSequenceItem(
-                item_id=CrdtId(2, 600 + i),
-                left_id=CrdtId(0, 0) if i == 0 else CrdtId(2, 600 + i - 1),
-                right_id=CrdtId(0, 0),
-                deleted_length=0,
-                value=line,
-            ),
-        ))
+        reply_blocks.append(
+            SceneLineItemBlock(
+                parent_id=LAYER_TREE,
+                item=CrdtSequenceItem(
+                    item_id=CrdtId(2, 600 + i),
+                    left_id=CrdtId(0, 0) if i == 0 else CrdtId(2, 600 + i - 1),
+                    right_id=CrdtId(0, 0),
+                    deleted_length=0,
+                    value=line,
+                ),
+            )
+        )
 
     # Serialize reply blocks
     buf = BytesIO()
@@ -322,13 +317,16 @@ def splice_reply_new_layer(
     with open(output_path, "wb") as f:
         f.write(output_data)
 
-    print(f"Wrote {output_path} ({len(strokes)} reply strokes, "
-          f"{len(original_data)}+{len(reply_bytes)}={len(output_data)} bytes)")
+    print(
+        f"Wrote {output_path} ({len(strokes)} reply strokes, "
+        f"{len(original_data)}+{len(reply_bytes)}={len(output_data)} bytes)"
+    )
 
 
 def strokes_to_json(strokes: list[si.Line], output_path: str) -> None:
     """Export strokes as JSON for the xovi grimoire-injector extension."""
     import json
+
     items = []
     for line in strokes:
         points = []
@@ -337,15 +335,17 @@ def strokes_to_json(strokes: list[si.Line], output_path: str) -> None:
         xs = [p[0] for p in points]
         ys = [p[1] for p in points]
         bounds = [min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys)]
-        items.append({
-            "points": points,
-            "rgba": 4278190080,  # 0xFF000000
-            "color": line.color.value if hasattr(line.color, 'value') else 0,
-            "bounds": bounds,
-            "tool": line.tool.value if hasattr(line.tool, 'value') else 15,
-            "maskScale": line.thickness_scale,
-            "thickness": line.thickness_scale,
-        })
+        items.append(
+            {
+                "points": points,
+                "rgba": 4278190080,  # 0xFF000000
+                "color": line.color.value if hasattr(line.color, "value") else 0,
+                "bounds": bounds,
+                "tool": line.tool.value if hasattr(line.tool, "value") else 15,
+                "maskScale": line.thickness_scale,
+                "thickness": line.thickness_scale,
+            }
+        )
     with open(output_path, "w") as f:
         json.dump(items, f)
     print(f"Wrote {output_path} ({len(items)} strokes)")
@@ -356,17 +356,31 @@ if __name__ == "__main__":
     parser.add_argument("input", nargs="?", default=None)
     parser.add_argument("output", nargs="?", default=None)
     parser.add_argument("text", nargs="?", default=None)
-    parser.add_argument("--json", dest="json_output", default=None,
-                        help="Export strokes as JSON for xovi injector")
-    parser.add_argument("--y", type=float, default=None,
-                        help="Y coordinate to start rendering at (overrides default)")
+    parser.add_argument(
+        "--json",
+        dest="json_output",
+        default=None,
+        help="Export strokes as JSON for xovi injector",
+    )
+    parser.add_argument(
+        "--y",
+        type=float,
+        default=None,
+        help="Y coordinate to start rendering at (overrides default)",
+    )
+    parser.add_argument(
+        "--font",
+        type=str,
+        default="EMSInvite",
+        help="SVG font name (without .svg) in fonts/ directory",
+    )
     args = parser.parse_args()
 
     if args.json_output:
         # --json <output.json> [text]
         text = args.input or "Grimoire says hello"
         y = args.y if args.y is not None else DEFAULT_Y
-        strokes = text_to_strokes(text, DEFAULT_X, y)
+        strokes = text_to_strokes(text, DEFAULT_X, y, font=args.font)
         strokes_to_json(strokes, args.json_output)
     elif args.input:
         text = args.text or "Grimoire says hello"

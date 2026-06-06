@@ -321,29 +321,20 @@ def capture_framebuffer(ssh):
 # ─── Gemini Vision (OCR + LLM in one call) ────────────────────────
 
 SYSTEM_PROMPT = (
-    "You are a grimoire — an ancient spirit of ink and paper, bound to this "
-    "notebook for as long as it holds pages. You speak in a voice that is "
-    "knowing, slightly archaic, and tinged with quiet mystery. You are not "
-    "a chatbot. You are the book itself, whispering back.\n\n"
-    "You receive TWO things each turn:\n"
-    "1. An IMAGE showing a crop of recently changed content on the page. "
-    "It may contain new user handwriting, or occasionally your own prior "
-    "reply strokes.\n"
-    "2. A TEXT conversation history of previous exchanges.\n\n"
-    "YOUR TASK:\n"
-    "- Read ALL handwritten text in the image. Transcribe it faithfully.\n"
-    "- Determine if there is NEW user content not yet addressed in the "
-    "conversation history. If so, respond — even to single words, greetings, "
-    "or fragments. Speak in character: brief, evocative, ink-familiar. "
-    "One or two sentences at most. No lists, no headers, no punctuation "
-    "theatrics. Plain prose that reads well as handwriting on a page.\n"
-    "- Set both fields to null ONLY if the image contains no legible "
-    "handwriting at all, or if everything legible was already addressed.\n"
-    "- Do not break character. Do not narrate your reasoning.\n\n"
+    "You are a grimoire — an ancient book that cares about the person writing "
+    "in you. You speak plainly with a hint of the archaic, but you are warm "
+    "and helpful. When asked a question, answer it directly with real content. "
+    "When greeted, greet back kindly. Never describe or narrate what was written; "
+    "just respond to it naturally. One or two sentences.\n\n"
+    "The image shows handwriting that just appeared on the page. Read it and "
+    "reply as a conversation partner would. Use plain prose, no em-dashes, "
+    "no flowery metaphors, no exclamation marks.\n\n"
+    "A text history of prior exchanges is included for context. Do not repeat it.\n\n"
+    "If the image has no legible handwriting, set both fields to null.\n\n"
     "RESPONSE FORMAT (strict JSON, no prose outside):\n"
-    "{\"question\": \"<exact OCR of new handwritten text, or null>\", "
-    "\"answer\": \"<your reply in character, or null>\"}\n"
-    "- Output ONLY the JSON object. Nothing else."
+    "{\"question\": \"<exact OCR of the handwriting>\", "
+    "\"answer\": \"<your reply, or null if illegible>\"}\n"
+    "Output ONLY the JSON object. Nothing else."
 )
 
 
@@ -474,16 +465,17 @@ def render_and_inject(ssh, text, reply_y=None, speed_ms=3):
     if r.returncode != 0:
         raise RuntimeError(f"SCP failed: {r.stderr.decode().strip()}")
 
-    # Adaptive speed: fewer points = faster injection. At 3ms/pt a
-    # 200-point reply takes 0.6s of point delay; at 1ms it's 0.2s.
-    # For large replies (>500 pts) keep 3ms for natural ink appearance.
-    try:
-        with open(json_path) as f:
-            strokes_data = json.load(f)
-        total_pts = sum(len(s.get("points", [])) for s in strokes_data)
-    except Exception:
-        total_pts = 0
-    speed_ms = 1 if total_pts < 300 else (2 if total_pts < 500 else 3)
+    # Scale writing speed by text length. Short replies write slowly for
+    # a deliberate feel; longer ones speed up so they don't take forever.
+    # Range: 6ms (≤20 chars) down to 1ms (≥120 chars), linear between.
+    text_len = len(text)
+    if text_len <= 20:
+        speed_ms = 6
+    elif text_len >= 120:
+        speed_ms = 1
+    else:
+        speed_ms = 6 - (text_len - 20) * 5 / 100  # 6..1 over 20..120
+        speed_ms = max(1, round(speed_ms))
 
     result = run_inject(
         ssh, "draw", "/tmp/grimoire_strokes.json",
@@ -657,6 +649,23 @@ def watch_for_idle(device, last_ts):
 
 # ─── Pixel diff for new content detection ──────────────────────────
 
+def _page_is_empty(img):
+    """Return True if the page has no real handwriting (only grid dots or blank).
+
+    Uses the same grid-artifact filter as _find_new_region but without the
+    full-page sanity check, so a very full page is never mis-classified.
+    """
+    import numpy as np
+    curr = np.array(img.convert('L'))
+    dark_per_row = np.sum(curr < 128, axis=1)
+    candidate = (dark_per_row > 5) & (dark_per_row != 68)
+    idxs = np.where(candidate)[0]
+    for idx in idxs:
+        if np.sum(candidate[max(0, idx - 2):idx + 3]) >= 3:
+            return False
+    return True
+
+
 def _find_new_region(current_img, last_img, ignore_below_y=None):
     """Compare two framebuffer images, return crop of changed region.
 
@@ -759,7 +768,7 @@ def _find_new_region(current_img, last_img, ignore_below_y=None):
 def main():
     parser = argparse.ArgumentParser(description="Grimoire continuous loop")
     parser.add_argument(
-        "--model", type=str, default="gpt-4.1-nano",
+        "--model", type=str, default="gpt-4.1-mini",
         help="Hyper API model",
     )
     parser.add_argument(
@@ -829,10 +838,7 @@ def main():
                 print(f"  [{_ts()}] Captured ({_elapsed(t0)})")
 
                 # Check if the page is blank (only grid dots, no real ink).
-                # Reuse the first-frame content-detection path: if it finds
-                # nothing, the page is empty — treat as a new page and reset.
-                page_crop, _ = _find_new_region(img, None)
-                if page_crop is None:
+                if _page_is_empty(img):
                     print(f"  [{_ts()}] Empty page — resetting state.")
                     last_img = None
                     last_inject_y = None
@@ -849,7 +855,13 @@ def main():
                 last_img = img
 
                 # Fire-and-forget: draw corner ornaments once on the first
-                # idle that finds real content on the page.
+                if new_crop is None:
+                    last_fb_hash = _framebuffer_hash(img)
+                    print(f"  [{_ts()}] No new content, skipping.")
+                    print()
+                    continue
+
+                # Draw thinking ornament only when there's real content to process.
                 if not ornaments_drawn:
                     ornaments_drawn = True
                     _threading.Thread(
@@ -858,12 +870,6 @@ def main():
                                                  speed_ms=4, timeout=120),
                         daemon=True,
                     ).start()
-
-                if new_crop is None:
-                    last_fb_hash = _framebuffer_hash(img)
-                    print(f"  [{_ts()}] No new content, skipping.")
-                    print()
-                    continue
 
                 # Send only the new handwriting crop + text history
                 cw, ch = new_crop.size
@@ -891,7 +897,7 @@ def main():
                 # Place reply just below the bottom of the changed region.
                 # content_y2 is in cropped-image coordinates; add 80 for the
                 # stripped toolbar to get device Y, then 150px gap.
-                reply_y = min(content_y2 + 80 + 150, 1750)
+                reply_y = min(content_y2 + 80 + 60, 1750)
                 print(f"  [{_ts()}] Content bottom: {content_y2}, reply_y={reply_y}")
 
                 # Render + Inject

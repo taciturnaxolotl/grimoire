@@ -66,7 +66,26 @@ static int do_erase_strokes(int fd, const char *json, long fsize) {
             if (!p) break;
             p++;
 
-            emit_event(fd, EV_KEY, BTN_TOOL_RUBBER, 1);
+            /* Peek first point for hover frame */
+            float hx, hy;
+            int hs, hw, hd, hp;
+            char *saved_p = p;
+            if (sscanf(p, "[%f,%f,%d,%d,%d,%d]", &hx, &hy, &hs, &hw, &hd, &hp) == 6) {
+                int hwx, hwy;
+                rm_to_wacom(hx + ox, hy + oy, &hwx, &hwy);
+                emit_event(fd, EV_KEY, BTN_TOOL_RUBBER, 1);
+                emit_event(fd, EV_ABS, ABS_X, hwx);
+                emit_event(fd, EV_ABS, ABS_Y, hwy);
+                emit_event(fd, EV_ABS, ABS_DISTANCE, 60);
+                emit_syn(fd);
+                usleep(2000);
+            } else {
+                emit_event(fd, EV_KEY, BTN_TOOL_RUBBER, 1);
+                emit_event(fd, EV_ABS, ABS_DISTANCE, 60);
+                emit_syn(fd);
+                usleep(2000);
+            }
+            p = saved_p;
             emit_event(fd, EV_KEY, BTN_TOUCH, 1);
 
             int bracket_depth = 1;  /* we're inside the outer [ */
@@ -171,7 +190,14 @@ int main(int argc, char **argv) {
 
         float step = 8.0f;
         int wx, wy;
+        /* Hover to start position before touching down */
+        rm_to_wacom(ex, ey, &wx, &wy);
         emit_event(fd, EV_KEY, BTN_TOOL_RUBBER, 1);
+        emit_event(fd, EV_ABS, ABS_X, wx);
+        emit_event(fd, EV_ABS, ABS_Y, wy);
+        emit_event(fd, EV_ABS, ABS_DISTANCE, 60);
+        emit_syn(fd);
+        usleep(2000);
         emit_event(fd, EV_KEY, BTN_TOUCH, 1);
 
         for (float row = ey; row <= ey + eh; row += step) {
@@ -248,7 +274,24 @@ int main(int argc, char **argv) {
         if (!p) break;
         p++;
 
-        emit_event(fd, EV_KEY, BTN_TOOL_PEN, 1);
+        /* Peek first point for hover frame */
+        float hx, hy;
+        int hs, hw, hd, hp;
+        if (sscanf(p, "[%f,%f,%d,%d,%d,%d]", &hx, &hy, &hs, &hw, &hd, &hp) == 6) {
+            int hwx, hwy;
+            rm_to_wacom(hx, hy, &hwx, &hwy);
+            emit_event(fd, EV_KEY, BTN_TOOL_PEN, 1);
+            emit_event(fd, EV_ABS, ABS_X, hwx);
+            emit_event(fd, EV_ABS, ABS_Y, hwy);
+            emit_event(fd, EV_ABS, ABS_DISTANCE, 60);
+            emit_syn(fd);
+            usleep(2000);
+        } else {
+            emit_event(fd, EV_KEY, BTN_TOOL_PEN, 1);
+            emit_event(fd, EV_ABS, ABS_DISTANCE, 60);
+            emit_syn(fd);
+            usleep(2000);
+        }
         emit_event(fd, EV_KEY, BTN_TOUCH, 1);
 
         int point_count = 0;
