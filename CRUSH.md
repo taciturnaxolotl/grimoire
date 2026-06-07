@@ -1,6 +1,6 @@
-# Grimoire — Project context
+# Glossa — Project context
 
-What follows is hard-won knowledge from building the grimoire closed loop
+What follows is hard-won knowledge from building the glossa closed loop
 on reMarkable 2. Do not unlearn any of this.
 
 ## Coordinates
@@ -66,13 +66,13 @@ for correct ordering. Use `_find_last_root_child()` to scan existing blocks.
 - Page: `5b66f39c-9d00-40a7-bce0-9fb3a044d446.rm`
 - Path: `/home/root/.local/share/remarkable/xochitl/5c81a1df-c36c-4eea-9289-978dfcc655a1/`
 
-## Xovi extension (`xovi-ext/grimoire-injector/`)
+## Xovi extension (`xovi-ext/glossa-injector/`)
 
 Native C++ extension that runs inside xochitl's process via LD_PRELOAD.
 
 ### What it does
-- Registers `GrimoireInjector` QML singleton at `dev.grimoire.injector 0.1`
-- Spawns a pthread that polls `/tmp/grimoire_strokes.json` every 1s
+- Registers `GlossaInjector` QML singleton at `dev.glossa.injector 0.1`
+- Spawns a pthread that polls `/tmp/glossa_strokes.json` every 1s
 - On file change, uses `QMetaObject::invokeMethod(Qt::QueuedConnection)` to
   call back into the main thread for stroke loading
 - Creates `SceneLineItem` objects using reverse-engineered structs from
@@ -112,9 +112,9 @@ ssh remarkable 'systemctl reset-failed xochitl && systemctl restart xochitl'
 ```
 
 The `build.sh` script:
-1. Creates/reuses a persistent `grimoire-builder` Docker container with the
+1. Creates/reuses a persistent `glossa-builder` Docker container with the
    `eeems/remarkable-toolchain:latest-rm2` image. Mounts the **whole**
-   `xovi-ext` tree at `/xovi-ext` (not just `grimoire-injector`) so any
+   `xovi-ext` tree at `/xovi-ext` (not just `glossa-injector`) so any
    sub-project can compile.
 2. Builds the extension: `qmake6 && make` inside the container
    (incremental compilation).
@@ -184,25 +184,25 @@ Key uinject learnings:
 }]
 ```
 
-Generate with: `python grimoire.py --json output.json "text"`
+Generate with: `python glossa.py --json output.json "text"`
 
-## Closed-loop daemon (`grimoire_loop.py`)
+## Closed-loop daemon (`glossa_loop.py`)
 
 The full pen-to-reply loop. Watches for pen idle, captures the screen,
 sends it to a vision model, and writes the reply back as ink.
 
 ```sh
-python grimoire_loop.py [--model MODEL] [--once]
+python glossa_loop.py [--model MODEL] [--once]
 ```
 
 ### Pipeline
 
 1. **Idle detection** (xovi extension, `PenIdleWatcher`): an event filter on
    QGuiApplication watches mouse/touch press+release. A debounce thread
-   writes `/tmp/grimoire_idle` after the pen has been up for `DEBOUNCE_MS`
+   writes `/tmp/glossa_idle` after the pen has been up for `DEBOUNCE_MS`
    (currently 2500ms). The Python daemon polls that file over persistent SSH.
-2. **Capture**: trigger `/tmp/grimoire_screenshot`, the extension dumps the
-   framebuffer to `/tmp/grimoire_fb.raw`, pull it via SCP.
+2. **Capture**: trigger `/tmp/glossa_screenshot`, the extension dumps the
+   framebuffer to `/tmp/glossa_fb.raw`, pull it via SCP.
 3. **Crop**: drop top 80px (toolbar) and bottom 200px (swirl zone).
 4. **Blank check**: skip the API entirely if no real content (see grid
    artifact note below).
@@ -260,36 +260,36 @@ joins with a generous 15s timeout so the final erase finishes cleanly —
 
 ## Hard-won iteration loop
 
-When working on grimoire, this is the tight loop that works:
+When working on glossa, this is the tight loop that works:
 
-1. **Python changes** take effect on the next `grimoire_loop.py` run. No
+1. **Python changes** take effect on the next `glossa_loop.py` run. No
    deploy needed.
 2. **uinject changes**: `cd xovi-ext && bash build.sh` then the kill+rm+scp
    dance. Effective immediately (exec'd per call).
 3. **Extension (.so) changes**: `bash build.sh`, then restart xochitl.
    Slowest loop — avoid unless touching idle detection or framebuffer hooks.
 4. **Debugging the extension**: stderr is swallowed by xochitl. Write to a
-   file instead (`/tmp/grimoire_ext.log`) via a `grimoire_log()` helper.
-   Read it with `ssh remarkable 'cat /tmp/grimoire_ext.log'`.
-5. **Inspecting captures**: pull `/tmp/grimoire_fb.raw`, load as
+   file instead (`/tmp/glossa_ext.log`) via a `glossa_log()` helper.
+   Read it with `ssh remarkable 'cat /tmp/glossa_ext.log'`.
+5. **Inspecting captures**: pull `/tmp/glossa_fb.raw`, load as
    `Image.frombytes("RGBA", (1404, 1872), raw)`, annotate with PIL, save a
    PNG, and View it. This is how the grid artifact was found — always look
    at the actual pixels before trusting a heuristic.
 
-## Script usage (`grimoire.py`)
+## Script usage (`glossa.py`)
 
 ```sh
 # File-based injection (creates new layer in .rm file)
-python grimoire.py input.rm output.rm "reply text"
+python glossa.py input.rm output.rm "reply text"
 
 # JSON export for xovi injector (--y sets start Y in device coords)
-python grimoire.py --json /tmp/grimoire_strokes.json --y 400 "reply text"
+python glossa.py --json /tmp/glossa_strokes.json --y 400 "reply text"
 
 # Preview (renders SVG for visual tuning)
-python grimoire.py --preview "text"
+python glossa.py --preview "text"
 ```
 
-`grimoire.py` is also importable as a library:
+`glossa.py` is also importable as a library:
 `text_to_strokes(text, x, y)` returns `si.Line` objects;
 `strokes_to_json(strokes, path)` writes the uinject JSON. The loop uses it
 this way for the thinking indicator instead of shelling out.

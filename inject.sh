@@ -7,8 +7,8 @@ if [ $# -eq 0 ]; then
 fi
 
 TEXT="$*"
-TMP="/tmp/grimoire_test.json"
+TMP="/tmp/glossa_test.json"
 
-.venv/bin/python3 grimoire.py --json "$TMP" "$TEXT"
-scp "$TMP" remarkable:/tmp/grimoire_strokes.json
-ssh -o ConnectTimeout=10 remarkable '/home/root/uinject /tmp/grimoire_strokes.json'
+.venv/bin/python3 glossa.py --json "$TMP" "$TEXT"
+scp "$TMP" remarkable:/tmp/glossa_strokes.json
+ssh -o ConnectTimeout=10 remarkable '/home/root/uinject /tmp/glossa_strokes.json'

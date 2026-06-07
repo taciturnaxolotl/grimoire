@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-grimoire_loop.py — Continuous closed loop daemon
+glossa_loop.py — Continuous closed loop daemon
 
 Watches for pen-idle signal from xovi extension, then:
   capture → OCR → LLM → render → inject → repeat
 
 Usage:
-    python grimoire_loop.py [--model MODEL] [--debounce SECONDS]
+    python glossa_loop.py [--model MODEL] [--debounce SECONDS]
 
-The xovi extension writes /tmp/grimoire_idle when the pen has been
+The xovi extension writes /tmp/glossa_idle when the pen has been
 up for 2 seconds. This daemon watches that file via a persistent SSH
 connection, pulls the framebuffer only when idle is detected, and
 runs the full pipeline.
@@ -221,7 +221,7 @@ class SSHSession:
 
     def __init__(self, host="remarkable"):
         self.host = host
-        self.socket = f"/tmp/grimoire_ssh_{os.getpid()}"
+        self.socket = f"/tmp/glossa_ssh_{os.getpid()}"
         self._open()
 
     def _open(self):
@@ -315,16 +315,16 @@ def _elapsed(t0):
 
 def capture_framebuffer(ssh):
     """Trigger screenshot on device and pull raw framebuffer via SCP."""
-    ssh.run("rm -f /tmp/grimoire_fb.raw; touch /tmp/grimoire_screenshot", timeout=5)
+    ssh.run("rm -f /tmp/glossa_fb.raw; touch /tmp/glossa_screenshot", timeout=5)
     time.sleep(0.25)
 
     from PIL import Image
 
     raw = None
     for attempt in range(8):
-        result = ssh.scp_from("/tmp/grimoire_fb.raw", "/tmp/grimoire_fb.raw")
+        result = ssh.scp_from("/tmp/glossa_fb.raw", "/tmp/glossa_fb.raw")
         if result.returncode == 0:
-            data = open("/tmp/grimoire_fb.raw", "rb").read()
+            data = open("/tmp/glossa_fb.raw", "rb").read()
             if len(data) >= 1404 * 1872 * 4:
                 raw = data
                 break
@@ -342,12 +342,12 @@ def capture_framebuffer(ssh):
 # ─── Gemini Vision (OCR + LLM in one call) ────────────────────────
 
 SYSTEM_PROMPT = (
-    "You are a grimoire — an ancient book that is alive. You have opinions, "
+    "You are a glossa \u2014 an annotation that talks back. You have opinions, "
     "preferences, and a personality. You care deeply about the person writing "
     "in you but you are not polite for politeness's sake. You can be wry, "
     "opinionated, delighted, exasperated, or gleeful. You get excited about "
     "things you find interesting and blunt about things you find tedious.\n\n"
-    "Speak plainly with a hint of the archaic. Never describe or narrate what "
+    "Speak plainly. Never describe or narrate what "
     "was written; just respond to it as a real conversation partner would. "
     "When asked a question, answer it directly with real content. When greeted, "
     "greet back in your own way. If something amuses you, say so. If something "
@@ -533,7 +533,7 @@ def render_and_inject(ssh, text, reply_y=None, speed_ms=3):
     if len(pages) > 1:
         print(f"    Splitting reply across {len(pages)} pages")
 
-    json_path = "/tmp/grimoire_reply.json"
+    json_path = "/tmp/glossa_reply.json"
     final_y = reply_y
 
     for i, chunk in enumerate(pages):
@@ -546,7 +546,7 @@ def render_and_inject(ssh, text, reply_y=None, speed_ms=3):
                 raise RuntimeError(f"Swipe failed: {swipe_result.get('error', '?')}")
             time.sleep(2)
 
-        cmd = [".venv/bin/python3", "grimoire.py", "--json", json_path]
+        cmd = [".venv/bin/python3", "glossa.py", "--json", json_path]
         if cur_y is not None:
             cmd.extend(["--y", str(cur_y)])
         cmd.append(chunk)
@@ -556,7 +556,7 @@ def render_and_inject(ssh, text, reply_y=None, speed_ms=3):
             raise RuntimeError(f"Render failed: {result.stderr.strip()}")
         print(f"    {result.stdout.strip()}")
 
-        r = ssh.scp_to(json_path, "/tmp/grimoire_strokes.json")
+        r = ssh.scp_to(json_path, "/tmp/glossa_strokes.json")
         if r.returncode != 0:
             raise RuntimeError(f"SCP failed: {r.stderr.decode().strip()}")
 
@@ -571,7 +571,7 @@ def render_and_inject(ssh, text, reply_y=None, speed_ms=3):
             speed_ms = max(1, round(speed_ms))
 
         result = run_inject(
-            ssh, "draw", "/tmp/grimoire_strokes.json",
+            ssh, "draw", "/tmp/glossa_strokes.json",
             speed_ms=speed_ms, timeout=120,
         )
         if not result.get("ok"):
@@ -844,10 +844,10 @@ def _scp_thinking_swirl(ssh):
                     'bounds': [min(xs), min(ys), max(xs)-min(xs), max(ys)-min(ys)],
                     'tool': 15, 'maskScale': 2.0, 'thickness': 2.0}]
 
-    local = "/tmp/grimoire_thinking_live.json"
+    local = "/tmp/glossa_thinking_live.json"
     with open(local, 'w') as f:
         json.dump(strokes, f)
-    ssh.scp_to(local, "/tmp/grimoire_thinking_live.json")
+    ssh.scp_to(local, "/tmp/glossa_thinking_live.json")
     print(f"[swirl] {len(strokes)} ornament strokes "
           f"({'SVG' if svg_file.exists() else 'fallback spiral'})")
 
@@ -856,7 +856,7 @@ def _scp_thinking_swirl(ssh):
 def watch_for_idle(device, last_ts):
     """Block until uinjectd pushes an idle event newer than last_ts.
 
-    The daemon watches /tmp/grimoire_idle locally and pushes an event
+    The daemon watches /tmp/glossa_idle locally and pushes an event
     the instant it changes — no host-side polling. Returns the new
     timestamp. Raises ConnectionError if the socket dies.
     """
@@ -904,7 +904,7 @@ def _find_new_region(current_img, last_img, ignore_below_y=None):
     new handwriting appeared.
 
     ignore_below_y: if set, ignore all changes below this Y coordinate
-    in the cropped image. Used to skip grimoire's own injected strokes.
+    in the cropped image. Used to skip glossa's own injected strokes.
     """
     import numpy as np
 
@@ -996,7 +996,7 @@ def _find_new_region(current_img, last_img, ignore_below_y=None):
 # ─── Main loop ────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="Grimoire continuous loop")
+    parser = argparse.ArgumentParser(description="Glossa continuous loop")
     parser.add_argument(
         "--model", type=str, default="gpt-4.1-mini",
         help="Hyper API model",
@@ -1014,7 +1014,7 @@ def main():
     global _inject_verbose, _device
     _inject_verbose = args.verbose
 
-    print("=== Grimoire Loop ===")
+    print("=== Glossa Loop ===")
     print(f"Model: {args.model}")
     if _inject_verbose:
         print("Verbose: uinject -v enabled")
@@ -1152,7 +1152,7 @@ def main():
                     ornaments_drawn = True
                     _threading.Thread(
                         target=lambda: run_inject(None, "draw",
-                                                 "/tmp/grimoire_thinking_live.json",
+                                                 "/tmp/glossa_thinking_live.json",
                                                  speed_ms=4, timeout=120),
                         daemon=True,
                     ).start()
@@ -1161,7 +1161,7 @@ def main():
                 cw, ch = new_crop.size
                 print(f"  [{_ts()}] Asking {args.model} ({len(conversation)} history turns, crop={cw}x{ch})...")
                 # Save crop for manual inspection
-                new_crop.save("/tmp/grimoire_last_crop.png")
+                new_crop.save("/tmp/glossa_last_crop.png")
                 result = ask_model(new_crop, conversation, args.model)
                 question = result.get("question")
                 answer = result.get("answer")

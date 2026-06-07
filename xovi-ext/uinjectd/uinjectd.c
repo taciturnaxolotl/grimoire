@@ -1,4 +1,4 @@
-/* uinjectd.c — Persistent injection + event daemon for grimoire
+/* uinjectd.c — Persistent injection + event daemon for glossa
  *
  * Runs ON the reMarkable.  Listens on a TCP socket; the host connects
  * once and keeps the connection open for the whole session.  This kills
@@ -7,8 +7,8 @@
  * Two directions over one socket (newline-delimited JSON):
  *
  *   Host -> daemon (commands):
- *     {"cmd":"draw","file":"/tmp/grimoire_strokes.json","speed":3}
- *     {"cmd":"erase","file":"/tmp/grimoire_thinking_live.json","speed":20}
+ *     {"cmd":"draw","file":"/tmp/glossa_strokes.json","speed":3}
+ *     {"cmd":"erase","file":"/tmp/glossa_thinking_live.json","speed":20}
  *     {"cmd":"ping"}
  *
  *   Daemon -> host (responses + pushed events):
@@ -17,7 +17,7 @@
  *     {"resp":"ping","ok":true}
  *     {"event":"idle","ts":172...}            <- pushed, no request
  *
- * The daemon watches /tmp/grimoire_idle (written by the xovi extension)
+ * The daemon watches /tmp/glossa_idle (written by the xovi extension)
  * and pushes an "idle" event whenever it changes.  The host no longer
  * polls.
  *
@@ -40,7 +40,7 @@
 
 #define DEV_PATH   "/dev/input/event1"
 #define TOUCH_PATH "/dev/input/event2"
-#define IDLE_PATH  "/tmp/grimoire_idle"
+#define IDLE_PATH  "/tmp/glossa_idle"
 #define DEFAULT_PORT 9999
 #define MAX_CMD    4096
 
@@ -375,8 +375,8 @@ static void handle_command(const char *line) {
     /* Capture: trigger screenshot, wait for FB dump, stream raw bytes */
     if (strncmp(cmd, "capture", 7) == 0) {
         /* Trigger the xovi watch thread to dump the framebuffer */
-        unlink("/tmp/grimoire_fb.raw");
-        int tf = open("/tmp/grimoire_screenshot", O_CREAT|O_WRONLY, 0644);
+        unlink("/tmp/glossa_fb.raw");
+        int tf = open("/tmp/glossa_screenshot", O_CREAT|O_WRONLY, 0644);
         if (tf >= 0) close(tf);
 
         /* Wait for the dump (watch thread checks every ~1s worst case) */
@@ -385,7 +385,7 @@ static void handle_command(const char *line) {
         long fb_size = 0;
         for (int i = 0; i < 20; i++) {
             usleep(100000);  /* 100ms polls */
-            FILE *fp = fopen("/tmp/grimoire_fb.raw", "r");
+            FILE *fp = fopen("/tmp/glossa_fb.raw", "r");
             if (!fp) continue;
             fseek(fp, 0, SEEK_END);
             fb_size = ftell(fp);

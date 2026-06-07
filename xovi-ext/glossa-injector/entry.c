@@ -7,7 +7,7 @@
 #include <unistd.h>
 #include "xovi.h"
 
-void registerGrimoire();
+void registerGlossa();
 extern char *program_invocation_short_name;
 
 /* Global state captured by hooks */
@@ -24,17 +24,17 @@ static void sigusr1Handler(int sig) {
     g_reloadRequested = 1;
 }
 
-/* Exports for GrimoireInjector.cpp to access */
-void *grimoire_getQmlEngine(void) { return g_qmlEngine; }
-void *grimoire_getSceneController(void) { return g_sceneController; }
-int grimoire_checkReload(void) {
+/* Exports for GlossaInjector.cpp to access */
+void *glossa_getQmlEngine(void) { return g_qmlEngine; }
+void *glossa_getSceneController(void) { return g_sceneController; }
+int glossa_checkReload(void) {
     if (g_reloadRequested) {
         g_reloadRequested = 0;
         return 1;
     }
     return 0;
 }
-void *grimoire_getFramebuffer(int *w, int *h, int *bpl, int *fmt) {
+void *glossa_getFramebuffer(int *w, int *h, int *bpl, int *fmt) {
     if (w) *w = g_fbWidth;
     if (h) *h = g_fbHeight;
     if (bpl) *bpl = g_fbBpl;
@@ -54,11 +54,11 @@ void override$_ZN6QImageC1EPhiiiNS_6FormatEPFvPvES2_(
         g_fbHeight = h;
         g_fbBpl = bpl;
         g_fbFormat = fmt;
-        fprintf(stderr, "[grimoire] Framebuffer captured: %p %dx%d bpl=%d fmt=%d\n",
+        fprintf(stderr, "[glossa] Framebuffer captured: %p %dx%d bpl=%d fmt=%d\n",
                 data, w, h, bpl, fmt);
     }
     
-    /* Screenshot trigger is now handled by the watch thread in GrimoireInjector */
+    /* Screenshot trigger is now handled by the watch thread in GlossaInjector */
     
     $_ZN6QImageC1EPhiiiNS_6FormatEPFvPvES2_(self, data, w, h, bpl, fmt, cleanup, info);
 }
@@ -74,15 +74,15 @@ static void hookedAddDrawingLine(void *closure, void *scene) {
     void **captured = (void **)closure;
     void *sc_this = captured[0];
 
-    fprintf(stderr, "[grimoire] addDrawingLine called! closure=%p scene=%p this=%p\n",
+    fprintf(stderr, "[glossa] addDrawingLine called! closure=%p scene=%p this=%p\n",
             closure, scene, sc_this);
     for (int i = 0; i < 4; i++) {
-        fprintf(stderr, "[grimoire]   closure[%d] = %p\n", i, captured[i]);
+        fprintf(stderr, "[glossa]   closure[%d] = %p\n", i, captured[i]);
     }
 
     if (g_sceneController == NULL) {
         g_sceneController = sc_this;
-        fprintf(stderr, "[grimoire] Captured SceneController @ %p\n", sc_this);
+        fprintf(stderr, "[glossa] Captured SceneController @ %p\n", sc_this);
     }
 
     if (g_origAddDrawingLine) {
@@ -96,14 +96,14 @@ void _xovi_construct() {
     }
 
     /* Write proof-of-life to a file since stderr may be swallowed */
-    FILE *log = fopen("/tmp/grimoire_ext.log", "a");
+    FILE *log = fopen("/tmp/glossa_ext.log", "a");
     if (log) {
         fprintf(log, "[%d] _xovi_construct called for %s\n",
                 getpid(), program_invocation_short_name);
         fclose(log);
     }
 
-    printf("[grimoire] Main process (%s), registering hooks + singleton\n",
+    printf("[glossa] Main process (%s), registering hooks + singleton\n",
            program_invocation_short_name);
 
     /* Install SIGUSR1 handler for hot-reload signaling */
@@ -111,7 +111,7 @@ void _xovi_construct() {
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = sigusr1Handler;
     sigaction(SIGUSR1, &sa, NULL);
-    fprintf(stderr, "[grimoire] SIGUSR1 handler installed (PID %d)\n", getpid());
+    fprintf(stderr, "[glossa] SIGUSR1 handler installed (PID %d)\n", getpid());
 
-    registerGrimoire();
+    registerGlossa();
 }

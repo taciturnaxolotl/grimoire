@@ -9,12 +9,12 @@
 #include "rm_SceneItem.hpp"
 #include "rm_Line.hpp"
 
-class GrimoireInjector : public QObject {
+class GlossaInjector : public QObject {
     Q_OBJECT
     Q_PROPERTY(bool armed READ isArmed WRITE setArmed NOTIFY armedChanged)
     Q_PROPERTY(bool thinking READ isThinking WRITE setThinking NOTIFY thinkingChanged)
 public:
-    explicit GrimoireInjector(QObject *parent = nullptr);
+    explicit GlossaInjector(QObject *parent = nullptr);
 
     Q_INVOKABLE int loadStrokes(const QString& path);
     Q_INVOKABLE bool setupVtable();
@@ -45,7 +45,7 @@ private:
     bool m_safezone = false;
     QQuickItem *m_thinkingOverlay = nullptr;
     QQuickItem *m_safezoneOverlay = nullptr;
-    QString m_watchPath = "/tmp/grimoire_strokes.json";
+    QString m_watchPath = "/tmp/glossa_strokes.json";
     qint64 m_lastModTime = 0;
 };
 
@@ -79,7 +79,7 @@ private:
     // Combined with the tap-refresh (any stroke resets the window),
     // normal mid-drawing pauses won't trigger it.
     static constexpr int DEBOUNCE_MS = 2500;
-    static constexpr const char *IDLE_PATH = "/tmp/grimoire_idle";
+    static constexpr const char *IDLE_PATH = "/tmp/glossa_idle";
 
     static void *debounceThreadFunc(void *arg);
     void writeIdleSignal();

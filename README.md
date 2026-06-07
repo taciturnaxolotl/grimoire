@@ -1,8 +1,8 @@
-# grimoire
+# glossa
 
 sppooky
 
-The canonical repo for this is hosted on tangled over at [`dunkirk.sh/grimoire`](https://tangled.org/dunkirk.sh/grimoire)
+The canonical repo for this is hosted on tangled over at [`dunkirk.sh/glossa`](https://tangled.org/dunkirk.sh/glossa)
 
 <p align="center">
     <img src="https://raw.githubusercontent.com/taciturnaxolotl/carriage/main/.github/images/line-break.svg" />
@@ -13,5 +13,5 @@ The canonical repo for this is hosted on tangled over at [`dunkirk.sh/grimoire`]
 </p>
 
 <p align="center">
-    <a href="https://tangled.org/dunkirk.sh/grimoire/blob/main/LICENSE.md"><img src="https://img.shields.io/static/v1.svg?style=for-the-badge&label=License&message=MIT&logoColor=d9e0ee&colorA=363a4f&colorB=b7bdf8"/></a>
+    <a href="https://tangled.org/dunkirk.sh/glossa/blob/main/LICENSE.md"><img src="https://img.shields.io/static/v1.svg?style=for-the-badge&label=License&message=MIT&logoColor=d9e0ee&colorA=363a4f&colorB=b7bdf8"/></a>
 </p>

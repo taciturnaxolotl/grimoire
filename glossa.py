@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-grimoire.py — Appends reply text as native ink to the user's handwriting.
+glossa.py — Appends reply text as native ink to the user's handwriting.
 
 Reads the user's .rm page, appends a NEW LAYER (Layer 2) with reply strokes
 rendered with EMS Allure font.
 
 Usage:
-    python grimoire.py source.rm output.rm "reply text"
+    python glossa.py source.rm output.rm "reply text"
 """
 
 import argparse
@@ -269,7 +269,7 @@ def splice_reply_new_layer(
     label_block = TreeNodeBlock(
         si.Group(
             node_id=LAYER_TREE,
-            label=LwwValue(CrdtId(2, 501), "grimoire"),
+            label=LwwValue(CrdtId(2, 501), "glossa"),
             visible=LwwValue(CrdtId(2, 502), True),
         )
     )
@@ -324,7 +324,7 @@ def splice_reply_new_layer(
 
 
 def strokes_to_json(strokes: list[si.Line], output_path: str) -> None:
-    """Export strokes as JSON for the xovi grimoire-injector extension."""
+    """Export strokes as JSON for the xovi glossa-injector extension."""
     import json
 
     items = []
@@ -378,12 +378,12 @@ if __name__ == "__main__":
 
     if args.json_output:
         # --json <output.json> [text]
-        text = args.input or "Grimoire says hello"
+        text = args.input or "Glossa says hello"
         y = args.y if args.y is not None else DEFAULT_Y
         strokes = text_to_strokes(text, DEFAULT_X, y, font=args.font)
         strokes_to_json(strokes, args.json_output)
     elif args.input:
-        text = args.text or "Grimoire says hello"
+        text = args.text or "Glossa says hello"
         output = args.output or args.input
         splice_reply_new_layer(args.input, output, text)
     else:

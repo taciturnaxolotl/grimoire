@@ -1,4 +1,4 @@
-# Grimoire — A Handwritten LLM Loop for the reMarkable 2
+# Glossa — A Handwritten LLM Loop for the reMarkable 2
 
 > Write a question by hand on a native notebook page; the device "writes back" an
 > answer as ink on the same page, leaving your original strokes untouched.
@@ -207,7 +207,7 @@ into whitespace on the replies layer → repaint.
   potluck.
 - **M3 — xochitl hooks.** Locate the four functions; read live strokes + inject in
   memory + repaint (Depth 2).
-- **M4 — Trigger + UX.** Pick the trigger mechanism; end‑to‑end live grimoire.
+- **M4 — Trigger + UX.** Pick the trigger mechanism; end‑to‑end live glossa.
 - **M5 — Polish.** Latency budget, error states, multi‑page, persistence guarantees.
 
 ---

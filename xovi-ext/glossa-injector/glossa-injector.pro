@@ -1,5 +1,5 @@
 TEMPLATE = lib
-TARGET = grimoire-injector
+TARGET = glossa-injector
 CONFIG += shared plugin no_plugin_name_prefix
 QMAKE_LFLAGS += -Wl,--no-undefined
 
@@ -9,8 +9,8 @@ UI_DIR = build/ui
 XOVI_DIR = build/xovi
 
 xoviextension.target = build/xovi/xovi.c
-xoviextension.commands = mkdir -p $$XOVI_DIR && python3 $$(XOVI_REPO)/util/xovigen.py -o $$XOVI_DIR/xovi.c -H $$XOVI_DIR/xovi.h grimoire-injector.xovi
-xoviextension.depends = grimoire-injector.xovi
+xoviextension.commands = mkdir -p $$XOVI_DIR && python3 $$(XOVI_REPO)/util/xovigen.py -o $$XOVI_DIR/xovi.c -H $$XOVI_DIR/xovi.h glossa-injector.xovi
+xoviextension.depends = glossa-injector.xovi
 
 QMAKE_EXTRA_TARGETS += xoviextension
 PRE_TARGETDEPS += $$XOVI_DIR/xovi.c
@@ -21,10 +21,10 @@ CONFIG += c++17
 
 SOURCES += \
     main.cpp entry.c $$XOVI_DIR/xovi.c \
-    GrimoireInjector.cpp \
+    GlossaInjector.cpp \
     rm_Line.cpp rm_SceneLineItem.cpp
 
-HEADERS += GrimoireInjector.hpp rm_Line.hpp rm_SceneItem.hpp rm_SceneLineItem.hpp
+HEADERS += GlossaInjector.hpp rm_Line.hpp rm_SceneItem.hpp rm_SceneLineItem.hpp
 INCLUDEPATH += $$XOVI_DIR
 
 QMAKE_CXXFLAGS += -fPIC -Werror -Wno-invalid-offsetof -O3 -mfpu=neon -mfloat-abi=hard

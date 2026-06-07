@@ -3,7 +3,7 @@
 set -e
 cd "$(dirname "$0")"
 
-CONTAINER="grimoire-builder"
+CONTAINER="glossa-builder"
 
 # Create persistent builder container if needed
 if ! docker inspect $CONTAINER &>/dev/null; then
@@ -26,9 +26,9 @@ make 2>&1
 ' 
 
 echo "Copying .so..."
-docker cp $CONTAINER:/src/grimoire-injector.so .
+docker cp $CONTAINER:/src/glossa-injector.so .
 
 echo "Deploying to device..."
-scp grimoire-injector.so remarkable:/home/root/xovi/extensions.d/
+scp glossa-injector.so remarkable:/home/root/xovi/extensions.d/
 
 echo "Done! Triple-tap to reload."

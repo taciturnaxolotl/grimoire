@@ -4,7 +4,7 @@
 void* SceneLineItem::vtable_ptr = nullptr;
 
 void SceneLineItem::setupVtable(void* vtable) {
-	printf("[grimoire] Setting SceneLineItem vtable to %p\n", vtable);
+	printf("[glossa] Setting SceneLineItem vtable to %p\n", vtable);
 	SceneLineItem::vtable_ptr = vtable;
 }
 

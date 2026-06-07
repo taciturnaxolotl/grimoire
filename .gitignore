@@ -18,8 +18,8 @@ Makefile
 # Compiled binaries (built by build.sh)
 xovi-ext/uinject/uinject
 xovi-ext/uinjectd/uinjectd
-xovi-ext/grimoire-injector/grimoire-injector.so
-xovi-ext/grimoired/grimoired
+xovi-ext/glossa-injector/glossa-injector.so
+xovi-ext/glossad/glossad
 xovi-ext/probe_touch
 
 # Cloned reference repos

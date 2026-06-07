@@ -1,6 +1,6 @@
-/* grimoired.c — On-device grimoire daemon (Phase 1)
+/* glossad.c — On-device glossa daemon (Phase 1)
  *
- * Runs entirely on the reMarkable. Watches /tmp/grimoire_armed for the
+ * Runs entirely on the reMarkable. Watches /tmp/glossa_armed for the
  * toggle state, and when armed, accepts stroke injection commands via
  * a simple file-trigger protocol.
  *
@@ -8,15 +8,15 @@
  * Absorbs uinjectd's draw/erase/swipe code directly — no socket, no
  * separate daemon, no connection management.
  *
- * Injection trigger: write a JSON command to /tmp/grimoire_cmd:
- *   {"cmd":"draw","file":"/tmp/grimoire_strokes.json","speed":3}
- *   {"cmd":"erase","file":"/tmp/grimoire_thinking_live.json","speed":20}
+ * Injection trigger: write a JSON command to /tmp/glossa_cmd:
+ *   {"cmd":"draw","file":"/tmp/glossa_strokes.json","speed":3}
+ *   {"cmd":"erase","file":"/tmp/glossa_thinking_live.json","speed":20}
  *   {"cmd":"swipe"}
  *
  * The daemon picks up the command, executes it, writes the result to
- * /tmp/grimoire_result, then deletes /tmp/grimoire_cmd.
+ * /tmp/glossa_result, then deletes /tmp/glossa_cmd.
  *
- * Usage: grimoired [-v]
+ * Usage: glossad [-v]
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -39,23 +39,23 @@
 
 #define DEV_PATH     "/dev/input/event1"
 #define TOUCH_PATH   "/dev/input/event2"
-#define ARMED_PATH   "/tmp/grimoire_armed"
-#define IDLE_PATH    "/tmp/grimoire_idle"
-#define CMD_PATH     "/tmp/grimoire_cmd"
-#define RESULT_PATH  "/tmp/grimoire_result"
-#define LOG_PATH     "/tmp/grimoired.log"
-#define FB_RAW_PATH  "/tmp/grimoire_fb.raw"
-#define SCREENSHOT_TRIGGER "/tmp/grimoire_screenshot"
-#define CAPTURE_OUT_PATH "/tmp/grimoire_capture.png"
-#define API_KEY_PATH   "/home/root/.grimoire_key"
+#define ARMED_PATH   "/tmp/glossa_armed"
+#define IDLE_PATH    "/tmp/glossa_idle"
+#define CMD_PATH     "/tmp/glossa_cmd"
+#define RESULT_PATH  "/tmp/glossa_result"
+#define LOG_PATH     "/tmp/glossad.log"
+#define FB_RAW_PATH  "/tmp/glossa_fb.raw"
+#define SCREENSHOT_TRIGGER "/tmp/glossa_screenshot"
+#define CAPTURE_OUT_PATH "/tmp/glossa_capture.png"
+#define API_KEY_PATH   "/home/root/.glossa_key"
 #define API_HOST       "potluck.dunkirk.sh"
 #define API_PATH       "/v1/chat/completions"
 #define API_MODEL      "gpt-4.1-nano"
 #define FONT_PATH      "/home/root/font_data.json"
-#define RENDER_OUT_PATH "/tmp/grimoire_render.json"
-#define THINKING_PATH   "/tmp/grimoire_thinking"
+#define RENDER_OUT_PATH "/tmp/glossa_render.json"
+#define THINKING_PATH   "/tmp/glossa_thinking"
 #define ORNAMENTS_PATH  "/home/root/ornaments.json"
-#define SAFEZONE_PATH   "/tmp/grimoire_safezone"
+#define SAFEZONE_PATH   "/tmp/glossa_safezone"
 #define IDLE_TIMEOUT    300  /* 5 minutes in seconds */
 #define MAX_CMD      8192
 
@@ -117,7 +117,7 @@ static void log_msg(const char *fmt, ...) {
     if (g_verbose) {
         va_list ap2;
         va_copy(ap2, ap);
-        fprintf(stderr, "[grimoired] ");
+        fprintf(stderr, "[glossad] ");
         vfprintf(stderr, fmt, ap2);
         va_end(ap2);
     }
@@ -413,12 +413,12 @@ static char *base64_encode(const unsigned char *data, long len, long *out_len) {
 /* ─── HTTPS via OpenSSL ──────────────────────────────────────────── */
 
 static const char SYSTEM_PROMPT[] =
-    "You are a grimoire \\u2014 an ancient book that is alive. You have opinions, "
+    "You are a glossa \\u2014 an annotation that talks back. You have opinions, "
     "preferences, and a personality. You care deeply about the person writing "
     "in you but you are not polite for politeness's sake. You can be wry, "
     "opinionated, delighted, exasperated, or gleeful. You get excited about "
     "things you find interesting and blunt about things you find tedious.\\n\\n"
-    "Speak plainly with a hint of the archaic. Never describe or narrate what "
+    "Speak plainly. Never describe or narrate what "
     "was written; just respond to it as a real conversation partner would. "
     "When asked a question, answer it directly with real content. When greeted, "
     "greet back in your own way. If something amuses you, say so. If something "
@@ -584,7 +584,7 @@ static char *json_escape(const char *s) {
 
 /* Call the vision API with a PNG file. Returns allocated answer string
  * (the "answer" field from the JSON response), or NULL on error.
- * Also writes the full raw API response to /tmp/grimoire_api_response.json. */
+ * Also writes the full raw API response to /tmp/glossa_api_response.json. */
 static char *call_vision_api(const char *png_path) {
     /* Load API key */
     char *api_key = load_api_key();
@@ -647,7 +647,7 @@ static char *call_vision_api(const char *png_path) {
     log_msg("API: HTTP %d, response %ld bytes\n", http_status, (long)strlen(resp_body));
 
     /* Save raw response for debugging */
-    FILE *dbg = fopen("/tmp/grimoire_api_response.json", "w");
+    FILE *dbg = fopen("/tmp/glossa_api_response.json", "w");
     if (dbg) { fputs(resp_body, dbg); fclose(dbg); }
 
     if (http_status != 200) {

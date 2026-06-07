@@ -1,4 +1,4 @@
-#include "GrimoireInjector.hpp"
+#include "GlossaInjector.hpp"
 #include "rm_SceneLineItem.hpp"
 
 #include <QJsonDocument>
@@ -31,8 +31,8 @@
 #include <time.h>
 #include <cstdarg>
 
-static void grimoire_log(const char *fmt, ...) {
-    FILE *fp = fopen("/tmp/grimoire_ext.log", "a");
+static void glossa_log(const char *fmt, ...) {
+    FILE *fp = fopen("/tmp/glossa_ext.log", "a");
     if (fp) {
         va_list ap;
         va_start(ap, fmt);
@@ -43,19 +43,19 @@ static void grimoire_log(const char *fmt, ...) {
     }
 }
 
-static GrimoireInjector *g_instance = nullptr;
+static GlossaInjector *g_instance = nullptr;
 static PenIdleWatcher *g_idleWatcher = nullptr;
 
 /* Provided by entry.c hooks */
 extern "C" {
-    void *grimoire_getQmlEngine(void);
-    void *grimoire_getSceneController(void);
-    int grimoire_checkReload(void);
-    void *grimoire_getFramebuffer(int *w, int *h, int *bpl, int *fmt);
+    void *glossa_getQmlEngine(void);
+    void *glossa_getSceneController(void);
+    int glossa_checkReload(void);
+    void *glossa_getFramebuffer(int *w, int *h, int *bpl, int *fmt);
 }
 
 static void *watchThreadFunc(void *) {
-    grimoire_log("Watch thread started");
+    glossa_log("Watch thread started");
     sleep(5);  // Wait for xochitl to fully initialize
 
     /* Start the pen idle watcher now that QGuiApplication should exist.
@@ -66,20 +66,20 @@ static void *watchThreadFunc(void *) {
         if (g_idleWatcher && qobject_cast<QGuiApplication*>(QCoreApplication::instance())) {
             QMetaObject::invokeMethod(g_idleWatcher, "activate", Qt::QueuedConnection);
             idleWatcherStarted = true;
-            grimoire_log("PenIdleWatcher activate queued (attempt %d)", attempt + 1);
+            glossa_log("PenIdleWatcher activate queued (attempt %d)", attempt + 1);
         } else {
-            grimoire_log("Waiting for QGuiApplication (attempt %d, g_idleWatcher=%p, app=%p)...",
+            glossa_log("Waiting for QGuiApplication (attempt %d, g_idleWatcher=%p, app=%p)...",
                          attempt + 1, (void*)g_idleWatcher, (void*)QGuiApplication::instance());
             sleep(2);
         }
     }
     if (!idleWatcherStarted) {
-        grimoire_log("WARNING: PenIdleWatcher failed to start!");
+        glossa_log("WARNING: PenIdleWatcher failed to start!");
     }
 
-    const char *path = "/tmp/grimoire_strokes.json";
-    const char *armedPath = "/tmp/grimoire_armed";
-    const char *thinkingPath = "/tmp/grimoire_thinking";
+    const char *path = "/tmp/glossa_strokes.json";
+    const char *armedPath = "/tmp/glossa_armed";
+    const char *thinkingPath = "/tmp/glossa_thinking";
     long long lastMod = 0;
     int lastArmed = -1;
     int lastThinking = -1;
@@ -99,7 +99,7 @@ static void *watchThreadFunc(void *) {
                     QMetaObject::invokeMethod(g_instance, [capturedVal]() {
                         g_instance->setArmed(capturedVal != 0);
                     }, Qt::QueuedConnection);
-                    grimoire_log("Armed state changed: %d", val);
+                    glossa_log("Armed state changed: %d", val);
                 }
             }
             fclose(afp);
@@ -130,7 +130,7 @@ static void *watchThreadFunc(void *) {
 
         /* Check safezone state file */
         {
-            int szval = (access("/tmp/grimoire_safezone", F_OK) == 0) ? 1 : 0;
+            int szval = (access("/tmp/glossa_safezone", F_OK) == 0) ? 1 : 0;
             static int lastSafezone = -1;
             if (szval != lastSafezone && g_instance) {
                 lastSafezone = szval;
@@ -142,35 +142,35 @@ static void *watchThreadFunc(void *) {
         }
 
         /* Check for hot-reload signal */
-        if (grimoire_checkReload()) {
-            fprintf(stderr, "[grimoire] Hot-reload signal received! Re-scanning...\n");
+        if (glossa_checkReload()) {
+            fprintf(stderr, "[glossa] Hot-reload signal received! Re-scanning...\n");
             lastMod = 0;  // Force re-read of stroke file
         }
 
         /* Check for screenshot trigger */
-        if (access("/tmp/grimoire_screenshot", F_OK) == 0) {
-            unlink("/tmp/grimoire_screenshot");
+        if (access("/tmp/glossa_screenshot", F_OK) == 0) {
+            unlink("/tmp/glossa_screenshot");
             int sw, sh, sbpl, sfmt;
-            void *fb = grimoire_getFramebuffer(&sw, &sh, &sbpl, &sfmt);
+            void *fb = glossa_getFramebuffer(&sw, &sh, &sbpl, &sfmt);
             if (fb && sw > 0 && sh > 0) {
-                const char *outpath = "/tmp/grimoire_fb.raw";
+                const char *outpath = "/tmp/glossa_fb.raw";
                 FILE *fp = fopen(outpath, "wb");
                 if (fp) {
                     size_t size = (size_t)sbpl * sh;
                     fwrite(fb, 1, size, fp);
                     fclose(fp);
-                    fprintf(stderr, "[grimoire] Screenshot saved: %dx%d bpl=%d (%zu bytes)\n",
+                    fprintf(stderr, "[glossa] Screenshot saved: %dx%d bpl=%d (%zu bytes)\n",
                             sw, sh, sbpl, size);
                 }
             } else {
-                fprintf(stderr, "[grimoire] Screenshot requested but no framebuffer available\n");
+                fprintf(stderr, "[glossa] Screenshot requested but no framebuffer available\n");
             }
         }
 
         struct stat st;
         if (stat(path, &st) == 0 && st.st_mtime != lastMod) {
             lastMod = st.st_mtime;
-            fprintf(stderr, "[grimoire] File changed (mtime=%lld), triggering load\n",
+            fprintf(stderr, "[glossa] File changed (mtime=%lld), triggering load\n",
                     (long long)lastMod);
             if (g_instance) {
                 // Call back into main thread
@@ -182,7 +182,7 @@ static void *watchThreadFunc(void *) {
     return nullptr;
 }
 
-GrimoireInjector::GrimoireInjector(QObject *parent)
+GlossaInjector::GlossaInjector(QObject *parent)
     : QObject(parent)
 {
     g_instance = this;
@@ -196,32 +196,32 @@ GrimoireInjector::GrimoireInjector(QObject *parent)
     pthread_t tid;
     pthread_create(&tid, nullptr, watchThreadFunc, nullptr);
     pthread_detach(tid);
-    fprintf(stderr, "[grimoire] Constructor done, watch thread spawned\n");
+    fprintf(stderr, "[glossa] Constructor done, watch thread spawned\n");
 }
 
-void GrimoireInjector::setArmed(bool armed) {
+void GlossaInjector::setArmed(bool armed) {
     if (m_armed == armed) return;
     m_armed = armed;
 
-    /* Write state file so grimoired can see it */
-    FILE *fp = fopen("/tmp/grimoire_armed", "w");
+    /* Write state file so glossad can see it */
+    FILE *fp = fopen("/tmp/glossa_armed", "w");
     if (fp) {
         fprintf(fp, "%d\n", armed ? 1 : 0);
         fclose(fp);
     }
-    grimoire_log("setArmed(%d)", armed);
+    glossa_log("setArmed(%d)", armed);
     emit armedChanged(armed);
 }
 
-void GrimoireInjector::setThinking(bool thinking) {
+void GlossaInjector::setThinking(bool thinking) {
     if (m_thinking == thinking) return;
     m_thinking = thinking;
-    grimoire_log("setThinking(%d)", thinking);
+    glossa_log("setThinking(%d)", thinking);
 
     /* Show/hide a simple pulsing dot overlay on the focused window */
     QQuickWindow *win = qobject_cast<QQuickWindow*>(QGuiApplication::focusWindow());
     if (!win) {
-        grimoire_log("setThinking: no focus window");
+        glossa_log("setThinking: no focus window");
         emit thinkingChanged(thinking);
         return;
     }
@@ -270,32 +270,32 @@ void GrimoireInjector::setThinking(bool thinking) {
                     if (item) {
                         item->setParentItem(win->contentItem());
                         m_thinkingOverlay = item;
-                        grimoire_log("Thinking overlay created");
+                        glossa_log("Thinking overlay created");
                     }
                 }
             } else {
-                grimoire_log("Thinking overlay QML error: %s",
+                glossa_log("Thinking overlay QML error: %s",
                              comp.errorString().toUtf8().constData());
             }
         } else {
-            grimoire_log("setThinking: no QQmlEngine available");
+            glossa_log("setThinking: no QQmlEngine available");
         }
     } else {
         /* Remove overlay */
         if (m_thinkingOverlay) {
             m_thinkingOverlay->deleteLater();
             m_thinkingOverlay = nullptr;
-            grimoire_log("Thinking overlay removed");
+            glossa_log("Thinking overlay removed");
         }
     }
 
     emit thinkingChanged(thinking);
 }
 
-void GrimoireInjector::setSafezone(bool safezone) {
+void GlossaInjector::setSafezone(bool safezone) {
     if (m_safezone == safezone) return;
     m_safezone = safezone;
-    grimoire_log("setSafezone(%d)", safezone);
+    glossa_log("setSafezone(%d)", safezone);
 
     QQuickWindow *win = qobject_cast<QQuickWindow*>(QGuiApplication::focusWindow());
     if (!win) { emit thinkingChanged(m_thinking); return; }
@@ -343,7 +343,7 @@ void GrimoireInjector::setSafezone(bool safezone) {
                     if (item) {
                         item->setParentItem(win->contentItem());
                         m_safezoneOverlay = item;
-                        grimoire_log("Safezone overlay created");
+                        glossa_log("Safezone overlay created");
                     }
                 }
             }
@@ -352,12 +352,12 @@ void GrimoireInjector::setSafezone(bool safezone) {
         if (m_safezoneOverlay) {
             m_safezoneOverlay->deleteLater();
             m_safezoneOverlay = nullptr;
-            grimoire_log("Safezone overlay removed");
+            glossa_log("Safezone overlay removed");
         }
     }
 }
 
-void GrimoireInjector::loadAndInject() {
+void GlossaInjector::loadAndInject() {
     QFileInfo fi(m_watchPath);
     if (!fi.exists()) return;
 
@@ -365,7 +365,7 @@ void GrimoireInjector::loadAndInject() {
     if (modTime == m_lastModTime) return;
 
     m_lastModTime = modTime;
-    fprintf(stderr, "[grimoire] File changed, injecting via synthetic tablet events...\n");
+    fprintf(stderr, "[glossa] File changed, injecting via synthetic tablet events...\n");
 
     int count = loadStrokes(m_watchPath);
     if (count == 0) return;
@@ -378,7 +378,7 @@ void GrimoireInjector::loadAndInject() {
         targetWin = guiApp->focusWindow();
         inputTarget = guiApp->focusObject();
         if (inputTarget) {
-            fprintf(stderr, "[grimoire] Focus object: %s @ %p\n",
+            fprintf(stderr, "[glossa] Focus object: %s @ %p\n",
                     inputTarget->metaObject()->className(), (void*)inputTarget);
         }
         
@@ -401,7 +401,7 @@ void GrimoireInjector::loadAndInject() {
                     QVariant val = prop.read(targetWin);
                     QObject *obj = val.value<QObject*>();
                     if (obj) {
-                        fprintf(stderr, "[grimoire]   %s: %s @ %p\n",
+                        fprintf(stderr, "[glossa]   %s: %s @ %p\n",
                                 prop.name(), obj->metaObject()->className(), (void*)obj);
                         if (!inputTarget) inputTarget = obj;
                     }
@@ -415,11 +415,11 @@ void GrimoireInjector::loadAndInject() {
     }
     
     if (!inputTarget) {
-        fprintf(stderr, "[grimoire] No input target found\n");
+        fprintf(stderr, "[glossa] No input target found\n");
         return;
     }
 
-    fprintf(stderr, "[grimoire] Posting %d strokes as tablet events to %s @ %p\n",
+    fprintf(stderr, "[glossa] Posting %d strokes as tablet events to %s @ %p\n",
             count, inputTarget->metaObject()->className(), (void*)inputTarget);
 
     /* Find the pen/stylus pointing device */
@@ -428,7 +428,7 @@ void GrimoireInjector::loadAndInject() {
     for (const QInputDevice *dev : allDevices) {
         const auto *pDev = dynamic_cast<const QPointingDevice*>(dev);
         if (!pDev) continue;
-        fprintf(stderr, "[grimoire]   device: %s type=%d pointer=%d\n",
+        fprintf(stderr, "[glossa]   device: %s type=%d pointer=%d\n",
                 pDev->name().toUtf8().constData(),
                 (int)pDev->type(), (int)pDev->pointerType());
         if (pDev->pointerType() == QPointingDevice::PointerType::Pen) {
@@ -442,14 +442,14 @@ void GrimoireInjector::loadAndInject() {
             const auto *pDev = dynamic_cast<const QPointingDevice*>(dev);
             if (pDev) {
                 penDevice = pDev;
-                fprintf(stderr, "[grimoire] No pen device, using fallback: %s\n",
+                fprintf(stderr, "[glossa] No pen device, using fallback: %s\n",
                         pDev->name().toUtf8().constData());
                 break;
             }
         }
     }
     if (!penDevice) {
-        fprintf(stderr, "[grimoire] No pointing devices available\n");
+        fprintf(stderr, "[glossa] No pointing devices available\n");
         return;
     }
 
@@ -513,13 +513,13 @@ void GrimoireInjector::loadAndInject() {
         QCoreApplication::sendEvent(inputTarget, &release);
     }
 
-    fprintf(stderr, "[grimoire] Posted all tablet events\n");
+    fprintf(stderr, "[glossa] Posted all tablet events\n");
 }
 
-int GrimoireInjector::loadStrokes(const QString& path) {
+int GlossaInjector::loadStrokes(const QString& path) {
     QFile file(path);
     if (!file.open(QIODevice::ReadOnly)) {
-        fprintf(stderr, "[grimoire] Cannot open %s\n", path.toUtf8().constData());
+        fprintf(stderr, "[glossa] Cannot open %s\n", path.toUtf8().constData());
         return 0;
     }
 
@@ -527,7 +527,7 @@ int GrimoireInjector::loadStrokes(const QString& path) {
     file.close();
     QJsonArray jsonArray = doc.array();
 
-    fprintf(stderr, "[grimoire] Loading %d strokes from %s\n",
+    fprintf(stderr, "[glossa] Loading %d strokes from %s\n",
            jsonArray.size(), path.toUtf8().constData());
 
     m_items.clear();
@@ -572,19 +572,19 @@ int GrimoireInjector::loadStrokes(const QString& path) {
         m_items.push_back(item);
     }
 
-    fprintf(stderr, "[grimoire] Loaded %d scene items\n", m_items.size());
+    fprintf(stderr, "[glossa] Loaded %d scene items\n", m_items.size());
     return m_items.size();
 }
 
-bool GrimoireInjector::setupVtable() {
+bool GlossaInjector::setupVtable() {
     if (m_items.empty()) {
-        fprintf(stderr, "[grimoire] setupVtable: no items loaded\n");
+        fprintf(stderr, "[glossa] setupVtable: no items loaded\n");
         return false;
     }
     auto* item = reinterpret_cast<SceneLineItem*>(m_items.first().get());
     SceneLineItem::setupVtable(item->vtable);
     m_vtableReady = true;
-    fprintf(stderr, "[grimoire] Vtable ready\n");
+    fprintf(stderr, "[glossa] Vtable ready\n");
     return true;
 }
 
@@ -606,17 +606,17 @@ void PenIdleWatcher::activate() {
 
     auto *app = qobject_cast<QGuiApplication*>(QCoreApplication::instance());
     if (!app) {
-        grimoire_log("PenIdleWatcher::activate: no QGuiApplication!");
+        glossa_log("PenIdleWatcher::activate: no QGuiApplication!");
         m_running = false;
         return;
     }
 
     app->installEventFilter(this);
-    grimoire_log("PenIdleWatcher: event filter installed");
+    glossa_log("PenIdleWatcher: event filter installed");
 
     pthread_create(&m_debounceThread, nullptr, debounceThreadFunc, this);
     pthread_detach(m_debounceThread);
-    grimoire_log("PenIdleWatcher: debounce thread started (debounce=%dms)", DEBOUNCE_MS);
+    glossa_log("PenIdleWatcher: debounce thread started (debounce=%dms)", DEBOUNCE_MS);
 }
 
 bool PenIdleWatcher::eventFilter(QObject * /*obj*/, QEvent *event) {
@@ -631,14 +631,14 @@ bool PenIdleWatcher::eventFilter(QObject * /*obj*/, QEvent *event) {
         m_penDown = false;
         m_lastLiftMs = nowMs();
         m_lastActivityMs = nowMs();  // lift also counts as activity
-        grimoire_log("Pen up (lift)");
+        glossa_log("Pen up (lift)");
     }
     return false;
 }
 
 void *PenIdleWatcher::debounceThreadFunc(void *arg) {
     auto *self = static_cast<PenIdleWatcher*>(arg);
-    fprintf(stderr, "[grimoire] PenIdleWatcher debounce thread running\n");
+    fprintf(stderr, "[glossa] PenIdleWatcher debounce thread running\n");
 
     while (self->m_running) {
         long long activity = self->m_lastActivityMs.load();
@@ -649,7 +649,7 @@ void *PenIdleWatcher::debounceThreadFunc(void *arg) {
             long long stuck = nowMs() - activity;
             if (stuck > 30000) {
                 self->m_penDown = false;
-                grimoire_log("Pen down stuck for %lldms, forcing lift", stuck);
+                glossa_log("Pen down stuck for %lldms, forcing lift", stuck);
             }
         }
         // Only fire when the pen is currently up AND the page has been
@@ -673,8 +673,8 @@ void PenIdleWatcher::writeIdleSignal() {
         long long ts = nowMs();
         fprintf(fp, "%lld\n", ts);
         fclose(fp);
-        grimoire_log("Idle signal written (ts=%lld)", ts);
+        glossa_log("Idle signal written (ts=%lld)", ts);
     } else {
-        grimoire_log("ERROR: failed to write %s", IDLE_PATH);
+        glossa_log("ERROR: failed to write %s", IDLE_PATH);
     }
 }
