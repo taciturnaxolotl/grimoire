@@ -78,6 +78,7 @@ scp "$UINJECT_DIR/uinject" remarkable:/home/root/uinject
 scp "$UINJECTD_DIR/uinjectd" remarkable:/home/root/uinjectd
 scp "$GRIMOIRED_DIR/grimoired" remarkable:/home/root/grimoired
 scp "$(dirname "$0")/../fonts/EMSAllure.svg" remarkable:/home/root/EMSAllure.svg
+scp "$(dirname "$0")/grimoired/font_data.json" remarkable:/home/root/font_data.json
 ssh remarkable '/home/root/uinjectd &'
 ssh remarkable '/home/root/grimoired &'
 

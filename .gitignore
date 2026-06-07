@@ -17,6 +17,7 @@ xovi-ext/uinjectd/uinjectd
 xovi-ext/grimoire-injector/uinject
 xovi-ext/grimoire-injector/grimoire-injector.so
 xovi-ext/probe_touch
+xovi-ext/grimoired/grimoired
 
 # Cloned repos (reference only)
 xovi-ext/xovi/

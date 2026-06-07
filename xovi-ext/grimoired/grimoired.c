@@ -51,11 +51,12 @@
 #define API_HOST       "potluck.dunkirk.sh"
 #define API_PATH       "/v1/chat/completions"
 #define API_MODEL      "gpt-4.1-nano"
-#define FONT_PATH      "/home/root/EMSAllure.svg"
+#define FONT_PATH      "/home/root/font_data.json"
 #define RENDER_OUT_PATH "/tmp/grimoire_render.json"
 #define THINKING_PATH   "/tmp/grimoire_thinking"
 #define ORNAMENTS_PATH  "/home/root/ornaments.json"
 #define SAFEZONE_PATH   "/tmp/grimoire_safezone"
+#define IDLE_TIMEOUT    300  /* 5 minutes in seconds */
 #define MAX_CMD      8192
 
 /* Framebuffer dimensions */
@@ -79,13 +80,17 @@
 /* External: font renderer (font_render.c) */
 extern int render_text_to_json(const char *text, const char *output_path,
                                float origin_x, float origin_y,
-                               const char *font_path);
+                               const char *font_path, int *consumed);
+
+/* Forward declarations */
+static char *build_messages_json(const char *img_b64, long b64_len);
 
 static int g_verbose = 0;
 static int g_dev_fd = -1;
 static volatile sig_atomic_t g_running = 1;
 static pthread_mutex_t g_inject_lock = PTHREAD_MUTEX_INITIALIZER;
 static time_t g_safezone_until = 0;
+static time_t g_last_activity = 0;
 
 /* ─── logging ────────────────────────────────────────────────────── */
 
@@ -605,26 +610,21 @@ static char *call_vision_api(const char *png_path) {
 
     log_msg("API: PNG %ld bytes -> base64 %ld bytes\n", png_size, b64_len);
 
-    /* Build request JSON */
-    char *escaped_prompt = json_escape(SYSTEM_PROMPT);
-    long req_cap = b64_len + strlen(escaped_prompt) + 2048;
+    /* Build request JSON with conversation history */
+    char *messages = build_messages_json(b64, b64_len);
+    free(b64);
+    if (!messages) { free(api_key); return NULL; }
+
+    long msg_len = strlen(messages);
+    long req_cap = msg_len + 512;
     char *req_body = malloc(req_cap);
-    if (!req_body) { free(b64); free(api_key); free(escaped_prompt); return NULL; }
+    if (!req_body) { free(messages); free(api_key); return NULL; }
 
     snprintf(req_body, req_cap,
-        "{"
-        "\"model\":\"%s\","
-        "\"messages\":["
-        "{\"role\":\"system\",\"content\":\"%s\"},"
-        "{\"role\":\"user\",\"content\":["
-        "{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,%s\"}}"
-        "]}"
-        "],"
-        "\"response_format\":{\"type\":\"json_object\"}"
-        "}",
-        API_MODEL, escaped_prompt, b64);
-    free(b64);
-    free(escaped_prompt);
+        "{\"model\":\"%s\",\"messages\":%s,"
+        "\"response_format\":{\"type\":\"json_object\"}}",
+        API_MODEL, messages);
+    free(messages);
 
     long req_len = strlen(req_body);
     log_msg("API: request body %ld bytes\n", req_len);
@@ -1045,7 +1045,7 @@ static void handle_command(const char *line) {
         float x = (float)json_int(line, "x", -550);
 
         log_msg("Render: \"%s\" at (%.0f, %.0f)\n", text_buf, x, y);
-        int strokes = render_text_to_json(text_buf, RENDER_OUT_PATH, x, y, FONT_PATH);
+        int strokes = render_text_to_json(text_buf, RENDER_OUT_PATH, x, y, FONT_PATH, NULL);
         if (strokes > 0) {
             char resp[256];
             snprintf(resp, sizeof(resp),
@@ -1139,6 +1139,62 @@ static long long read_idle_ts(void) {
     return ts;
 }
 
+/* ─── conversation history ───────────────────────────────────────── */
+
+#define MAX_HISTORY 20
+#define MAX_MSG_LEN 2048
+
+typedef struct {
+    char role[16];   /* "user" or "assistant" */
+    char content[MAX_MSG_LEN];
+} HistoryEntry;
+
+static HistoryEntry g_history[MAX_HISTORY];
+static int g_history_count = 0;
+
+static void history_add(const char *role, const char *content) {
+    if (g_history_count >= MAX_HISTORY) {
+        /* Shift oldest entries out */
+        memmove(&g_history[0], &g_history[2], sizeof(HistoryEntry) * (MAX_HISTORY - 2));
+        g_history_count -= 2;
+    }
+    strncpy(g_history[g_history_count].role, role, sizeof(g_history[g_history_count].role) - 1);
+    strncpy(g_history[g_history_count].content, content, MAX_MSG_LEN - 1);
+    g_history[g_history_count].content[MAX_MSG_LEN - 1] = '\0';
+    g_history_count++;
+}
+
+static void history_clear(void) {
+    g_history_count = 0;
+}
+
+/* Build the messages JSON array for the API call, including history.
+ * Returns allocated string. Caller must free. */
+static char *build_messages_json(const char *img_b64, long b64_len) {
+    /* System prompt + history + current image turn */
+    long cap = b64_len + g_history_count * MAX_MSG_LEN * 2 + 8192;
+    char *buf = malloc(cap);
+    if (!buf) return NULL;
+
+    long pos = 0;
+    pos += snprintf(buf + pos, cap - pos, "[{\"role\":\"system\",\"content\":\"%s\"}", SYSTEM_PROMPT);
+
+    for (int i = 0; i < g_history_count; i++) {
+        char *escaped = json_escape(g_history[i].content);
+        pos += snprintf(buf + pos, cap - pos,
+                        ",{\"role\":\"%s\",\"content\":\"%s\"}",
+                        g_history[i].role, escaped ? escaped : g_history[i].content);
+        free(escaped);
+    }
+
+    pos += snprintf(buf + pos, cap - pos,
+                    ",{\"role\":\"user\",\"content\":["
+                    "{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,%s\"}}"
+                    "]}]", img_b64);
+
+    return buf;
+}
+
 /* ─── full pipeline ──────────────────────────────────────────────── */
 
 static void run_pipeline(void) {
@@ -1154,7 +1210,8 @@ static void run_pipeline(void) {
 
     /* 2. Blank check */
     if (page_is_empty(fb)) {
-        log_msg("Pipeline: page empty, skipping\n");
+        log_msg("Pipeline: page empty, clearing history\n");
+        history_clear();
         free(fb);
         return;
     }
@@ -1204,36 +1261,59 @@ static void run_pipeline(void) {
 
     log_msg("Pipeline: answer=\"%s\"\n", answer);
 
+    /* Add to conversation history */
+    history_add("assistant", answer);
+
     /* 6. Calculate reply Y position */
     int reply_y = content_bottom + 80 + 60;
     if (reply_y > 1750) reply_y = 1750;
     log_msg("Pipeline: reply_y=%d\n", reply_y);
 
-    /* 7. Render text to strokes */
-    int strokes = render_text_to_json(answer, RENDER_OUT_PATH,
-                                       -550.0f, (float)reply_y, FONT_PATH);
+    /* 7. Render text to strokes (multi-page) */
+    {
+        const char *remaining = answer;
+        int page_num = 0;
+        float cur_y = (float)reply_y;
+
+        while (*remaining && page_num < 5) {  /* safety limit */
+            int consumed = 0;
+            int strokes = render_text_to_json(remaining, RENDER_OUT_PATH,
+                                               -550.0f, cur_y, FONT_PATH, &consumed);
+            if (strokes <= 0) {
+                log_msg("Pipeline: render failed on page %d\n", page_num);
+                break;
+            }
+            log_msg("Pipeline: page %d, rendered %d strokes (%d/%d bytes consumed)\n",
+                    page_num, strokes, consumed, (int)strlen(remaining));
+
+            /* Inject strokes for this page */
+            char *json = NULL;
+            long fsize = 0;
+            if (load_file(RENDER_OUT_PATH, &json, &fsize) == 0) {
+                pthread_mutex_lock(&g_inject_lock);
+                do_draw(g_dev_fd, json, 3000);
+                pthread_mutex_unlock(&g_inject_lock);
+                free(json);
+            }
+
+            remaining += consumed;
+
+            /* If there's more text, swipe to next page */
+            if (*remaining) {
+                log_msg("Pipeline: swiping to next page\n");
+                usleep(500000);  /* brief pause before swipe */
+                pthread_mutex_lock(&g_inject_lock);
+                do_swipe_page();
+                pthread_mutex_unlock(&g_inject_lock);
+                usleep(1000000);  /* wait for page turn animation */
+                cur_y = 100.0f;  /* start near top of new page */
+                page_num++;
+            }
+        }
+    }
     free(answer);
 
-    if (strokes <= 0) {
-        log_msg("Pipeline: render failed\n");
-        return;
-    }
-    log_msg("Pipeline: rendered %d strokes\n", strokes);
-
-    /* 8. Inject strokes */
-    char *json = NULL;
-    long fsize = 0;
-    if (load_file(RENDER_OUT_PATH, &json, &fsize) != 0) {
-        log_msg("Pipeline: cannot read rendered JSON\n");
-        return;
-    }
-
-    pthread_mutex_lock(&g_inject_lock);
-    int drawn = do_draw(g_dev_fd, json, 3000);  /* 3ms per point */
-    pthread_mutex_unlock(&g_inject_lock);
-    free(json);
-
-    log_msg("Pipeline: drew %d strokes, done\n", drawn);
+    log_msg("Pipeline: done\n");
 
     /* Signal thinking indicator OFF */
     unlink(THINKING_PATH);
@@ -1279,6 +1359,7 @@ int main(int argc, char **argv) {
                 FILE *sf = fopen(SAFEZONE_PATH, "w");
                 if (sf) { fputs("1\n", sf); fclose(sf); }
                 g_safezone_until = time(NULL) + 10;
+                g_last_activity = time(NULL);
                 log_msg("Safe zone active for 10s\n");
             } else {
                 unlink(SAFEZONE_PATH);
@@ -1318,12 +1399,27 @@ int main(int argc, char **argv) {
 
         /* Check for new idle signal → trigger pipeline (skip during safe zone) */
         long long cur_idle_ts = read_idle_ts();
-        if (cur_idle_ts > 0 && cur_idle_ts != last_idle_ts && g_safezone_until == 0) {
-            last_idle_ts = cur_idle_ts;
-            log_msg("Idle detected (ts=%lld), running pipeline\n", cur_idle_ts);
-            run_pipeline();
-            /* After pipeline, update idle baseline to avoid re-trigger */
-            last_idle_ts = read_idle_ts();
+        if (cur_idle_ts > 0 && cur_idle_ts != last_idle_ts) {
+            g_last_activity = time(NULL);  /* Reset inactivity timer on any pen activity */
+            if (g_safezone_until == 0) {
+                last_idle_ts = cur_idle_ts;
+                log_msg("Idle detected (ts=%lld), running pipeline\n", cur_idle_ts);
+                run_pipeline();
+                /* After pipeline, update idle baseline to avoid re-trigger */
+                last_idle_ts = read_idle_ts();
+            }
+        }
+
+        /* Auto-disarm after 5 minutes of no pen activity */
+        if (armed && g_last_activity > 0 && time(NULL) - g_last_activity > IDLE_TIMEOUT) {
+            log_msg("Auto-disarming after %ds inactivity\n", IDLE_TIMEOUT);
+            armed = 0;
+            unlink(SAFEZONE_PATH);
+            unlink(THINKING_PATH);
+            history_clear();
+            /* Write disarmed state so extension syncs */
+            FILE *af = fopen(ARMED_PATH, "w");
+            if (af) { fputs("0\n", af); fclose(af); }
         }
 
         usleep(200000);  /* Poll every 200ms when armed */
