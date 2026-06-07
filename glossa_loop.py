@@ -359,10 +359,10 @@ SYSTEM_PROMPT = (
     "reply naturally. Use plain prose, no em-dashes, no flowery metaphors, "
     "no exclamation marks.\n\n"
     "A text history of prior exchanges is included for context. Do not repeat it.\n\n"
-    "If the image has no legible handwriting, set both fields to null.\n\n"
+    "If the image is completely blank, set both fields to null. Otherwise, always provide an answer.\n\n"
     "RESPONSE FORMAT (strict JSON, no prose outside):\n"
     "{\"question\": \"<exact OCR of the handwriting>\", "
-    "\"answer\": \"<your reply, or null if illegible>\"}\n"
+    "\"answer\": \"<your reply, or null only if the page is blank>\"}\n"
     "Output ONLY the JSON object. Nothing else."
 )
 
@@ -772,9 +772,9 @@ def _scp_thinking_swirl(ssh):
             # rm coords: x ∈ [-702, 702], y ∈ [0, 1872] top-to-bottom.
             corners = [
                 (False, False,  132,  632,   50,  430),  # top-right
-                (True,  False, -632, -132,   50,  430),  # top-left
+                (True,  False, -647, -147,   50,  430),  # top-left
                 (False, True,   132,  632, 1442, 1822),  # bottom-right
-                (True,  True,  -632, -132, 1442, 1822),  # bottom-left
+                (True,  True,  -647, -147, 1442, 1822),  # bottom-left
             ]
 
             def make_strokes(polys, flip_x, flip_y, rx0, rx1, ry0, ry1):
@@ -953,16 +953,18 @@ def _find_new_region(current_img, last_img, ignore_below_y=None):
             mask[cutoff:, :] = False
 
     # Exclude the four corner ornament zones from diff detection.
-    # Ornament boxes (rm coords): x ±[182,682], y top [20,400], bottom [1472,1852]
-    # Converted to image pixels (rm_x+702, rm_y-80); image is 1404×1592.
-    cx = 500   # ornament horizontal extent from each edge (img px)
-    cy_top = 330   # ornament vertical extent from top
-    cy_bot = 210   # ornament vertical extent from bottom
+    # Ornament boxes (rm coords): right x=[585,691], left x=[-661,-540]
+    #   y top=[101,166], bottom=[1798,1864]. Converted to image pixels
+    #   (rm_x+702, rm_y-80); image is 1404×1592.
+    cx_right = 120   # ornament extent from right edge (img px)
+    cx_left = 165    # ornament extent from left edge (img px)
+    cy_top = 250     # ornament vertical extent from top
+    cy_bot = 150     # ornament vertical extent from bottom
     h, w = curr.shape
-    mask[:cy_top, :cx] = False            # top-left corner
-    mask[:cy_top, w - cx:] = False        # top-right corner
-    mask[h - cy_bot:, :cx] = False        # bottom-left corner
-    mask[h - cy_bot:, w - cx:] = False    # bottom-right corner
+    mask[:cy_top, :cx_left] = False           # top-left corner
+    mask[:cy_top, w - cx_right:] = False      # top-right corner
+    mask[h - cy_bot:, :cx_left] = False       # bottom-left corner
+    mask[h - cy_bot:, w - cx_right:] = False  # bottom-right corner
 
     # Threshold of 30 (was 50) catches lighter handwriting strokes without
     # being so sensitive that e-ink refresh noise triggers false positives.

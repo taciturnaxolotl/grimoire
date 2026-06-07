@@ -429,10 +429,10 @@ static const char SYSTEM_PROMPT[] =
     "The image shows handwriting that just appeared on the page. Read it and "
     "reply naturally. Use plain prose, no em-dashes, no flowery metaphors, "
     "no exclamation marks.\\n\\n"
-    "If the image has no legible handwriting, set both fields to null.\\n\\n"
+    "If the image is completely blank, set both fields to null. Otherwise, always provide an answer.\\n\\n"
     "RESPONSE FORMAT (strict JSON, no prose outside):\\n"
     "{\\\"question\\\": \\\"<exact OCR of the handwriting>\\\", "
-    "\\\"answer\\\": \\\"<your reply, or null if illegible>\\\"}\\n"
+    "\\\"answer\\\": \\\"<your reply, or null only if the page is blank>\\\"}\\n"
     "Output ONLY the JSON object. Nothing else.";
 
 /* Load API key from file. Returns allocated string or NULL. */
